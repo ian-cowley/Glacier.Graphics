@@ -1,0 +1,17 @@
+bin/
+obj/
+*.user
+*.suo
+.vs/
+.vscode/
+.idea/
+BenchmarkDotNet.Artifacts/
+appsettings.json
+appsettings.*.json
+!appsettings.template.json
+*.env
+*.env.*
+*.secret
+*.key
+*.pfx
+*.pem
