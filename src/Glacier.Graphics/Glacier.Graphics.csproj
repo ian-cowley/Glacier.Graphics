@@ -13,12 +13,12 @@
     <!-- NuGet Package Properties -->
     <PackageId>Glacier.Graphics</PackageId>
     <Version>1.0.0</Version>
-    <Authors>Glacier High-Performance Ecosystem</Authors>
+    <Authors>Ian Cowley</Authors>
     <Company>Glacier High-Performance Ecosystem</Company>
     <Description>Pure C# .NET 10 hardware-accelerated 2D vector graphics, compute rasterizer, font engine, SIMD PNG/JPEG codecs, and vector PDF generator.</Description>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
-    <PackageProjectUrl>https://github.com/ian-cowley/PolarsPlus</PackageProjectUrl>
-    <RepositoryUrl>https://github.com/ian-cowley/PolarsPlus.git</RepositoryUrl>
+    <PackageProjectUrl>https://github.com/ian-cowley/Glacier.Graphics</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/ian-cowley/Glacier.Graphics.git</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
     <PackageTags>graphics;vector;bezier;rasterizer;simd;avx512;png;jpeg;pdf;truetype;opentype;net10;glacier</PackageTags>
     <PackageReadmeFile>README.md</PackageReadmeFile>
