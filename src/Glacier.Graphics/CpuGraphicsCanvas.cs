@@ -75,7 +75,9 @@ public sealed class CpuGraphicsCanvas : IGraphicsCanvas
             paint.Join,
             paint.MiterLimit);
 
-        _rasterizer.FillPath(_framebuffer, stroked, paint.Color, WindingRule.NonZero, _currentState.Clip);
+        // Use EvenOdd winding so self-intersecting stroke polygons (e.g. fast-oscillating
+        // signal lines) render as thin strokes rather than solid filled regions.
+        _rasterizer.FillPath(_framebuffer, stroked, paint.Color, WindingRule.EvenOdd, _currentState.Clip);
     }
 
     public void FillPath(in VectorPath path, in Paint paint)
@@ -102,7 +104,7 @@ public sealed class CpuGraphicsCanvas : IGraphicsCanvas
                 ? char.ConvertToUtf32(text[i++], text[i])
                 : text[i];
 
-            int glyphIdx = font.Typeface?.GetGlyphIndex(codePoint) ?? 0;
+            int glyphIdx = font.EffectiveTypeface?.GetGlyphIndex(codePoint) ?? 0;
             float fracX = curX - MathF.Floor(curX);
 
             AtlasGlyph glyph = _atlas.GetOrAdd(font, glyphIdx, fracX);

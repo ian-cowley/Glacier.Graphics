@@ -73,10 +73,15 @@ public sealed class GlyphAtlas
         }
 
         // Render glyph
-        float scale = font.Typeface != null ? font.Size / font.Typeface.UnitsPerEm : font.Size / 1000f;
-        VectorPath glyphPath = font.Typeface?.GetGlyphPath(glyphIndex) ?? new VectorPath();
-        ushort adv = font.Typeface?.GetAdvanceWidth(glyphIndex) ?? (ushort)1000;
-        float advance = (adv / (float)(font.Typeface?.UnitsPerEm ?? 1000)) * font.Size;
+        var typeface = font.EffectiveTypeface;
+        float scale = typeface != null ? font.Size / typeface.UnitsPerEm : font.Size / 1000f;
+        VectorPath glyphPath = typeface?.GetGlyphPath(glyphIndex) ?? new VectorPath();
+        ushort adv = typeface?.GetAdvanceWidth(glyphIndex) ?? (ushort)1000;
+        if (adv == 0 && (typeface == null || glyphPath.VerbCount == 0))
+        {
+            adv = (ushort)(typeface?.UnitsPerEm ?? 1000);
+        }
+        float advance = (adv / (float)(typeface?.UnitsPerEm ?? 1000)) * font.Size;
 
         LcdGlyphBitmap bitmap = LcdGlyphRasterizer.Rasterize(glyphPath, scale, subpixelBin * 0.25f);
 

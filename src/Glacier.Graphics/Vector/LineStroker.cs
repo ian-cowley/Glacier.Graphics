@@ -158,8 +158,11 @@ public static class LineStroker
 
         if (inner.Count > 0)
         {
-            outPath.MoveTo(inner[0]);
-            for (int i = 1; i < inner.Count; i++) outPath.LineTo(inner[i]);
+            // Emit inner contour in reverse so its winding opposes the outer contour.
+            // With NonZero winding rule this produces a hollow annular stroke instead
+            // of a solid filled region.
+            outPath.MoveTo(inner[inner.Count - 1]);
+            for (int i = inner.Count - 2; i >= 0; i--) outPath.LineTo(inner[i]);
             outPath.Close();
         }
     }
