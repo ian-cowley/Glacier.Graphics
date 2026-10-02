@@ -68,4 +68,28 @@ public sealed class CanvasApiTests
         canvas.Restore();
         // State restored
     }
+
+    [Fact]
+    public void Canvas_DrawText_RendersPixels()
+    {
+        using var canvas = new CpuGraphicsCanvas(100, 100);
+        canvas.Clear(Rgba32.White);
+
+        var font = new Font(size: 20f);
+        canvas.DrawText("A", 10, 40, font, new Paint(Rgba32.Black));
+
+        int darkCount = 0;
+        for (int y = 0; y < 100; y++)
+        {
+            for (int x = 0; x < 100; x++)
+            {
+                var p = canvas.Framebuffer.GetPixel(x, y);
+                if (p.R < 200 || p.G < 200 || p.B < 200)
+                    darkCount++;
+            }
+        }
+
+        Assert.True(darkCount > 0, $"Expected dark pixels for rendered text, but found {darkCount}. System font: {font.EffectiveTypeface != null}");
+    }
 }
+
