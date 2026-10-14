@@ -1,3 +1,5 @@
+![Glacier.Graphics Banner](assets/banner.jpg)
+
 # 🎨 Glacier.Graphics
 
 **Pure C# .NET 10 Hardware-Accelerated 2D Vector Graphics, Compute Rasterizer, Font Engine, SIMD Codecs, and Vector PDF Generator**
@@ -46,6 +48,10 @@ Existing cross-platform graphics libraries in the .NET ecosystem (`SkiaSharp`, `
 ---
 
 ## 3. Architecture & Subsystems
+
+<p align="center">
+  <img src="assets/architecture.jpg" alt="Glacier.Graphics Architecture Blueprint" width="100%" />
+</p>
 
 ```
                                   Glacier.Graphics Architecture
