@@ -14,7 +14,7 @@
 
     <!-- NuGet Package Properties -->
     <PackageId>Glacier.Graphics</PackageId>
-    <Version>1.1.0</Version>
+    <Version>1.2.0</Version>
     <Authors>Ian Cowley</Authors>
     <Company>Glacier High-Performance Ecosystem</Company>
     <Description>Pure C# .NET 10 hardware-accelerated 2D vector graphics, analytical tile/CPU rasterizer, font engine, SIMD PNG/JPEG codecs, and vector PDF generator.</Description>
@@ -25,6 +25,10 @@
     <PackageTags>graphics;vector;bezier;rasterizer;simd;avx512;png;jpeg;pdf;truetype;opentype;net10;aot;glacier</PackageTags>
     <PackageReadmeFile>README.md</PackageReadmeFile>
   </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="Glacier.Graphics.Tests" />
+  </ItemGroup>
 
   <ItemGroup>
     <None Include="..\..\README.md" Pack="true" PackagePath="\" />

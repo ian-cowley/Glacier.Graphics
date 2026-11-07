@@ -18,3 +18,9 @@ appsettings*.json
 *.key
 *.pfx
 *.pem
+
+TestResults/
+*.log
+*.tmp
+*.env*
+!.env.example
