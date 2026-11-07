@@ -102,6 +102,7 @@ public sealed class JpegBitReader
     private int _offset;
     private uint _bitBuffer;
     private int _bitsCount;
+    private int _virtualBits;
 
     public JpegBitReader(ReadOnlyMemory<byte> data, int startOffset)
     {
@@ -109,6 +110,7 @@ public sealed class JpegBitReader
         _offset = startOffset;
         _bitBuffer = 0;
         _bitsCount = 0;
+        _virtualBits = 0;
     }
 
     public int ReadBit()
@@ -160,9 +162,40 @@ public sealed class JpegBitReader
         }
     }
 
+    public void ResetRestartMarker()
+    {
+        // Rewind only real (non-virtual) whole bytes that were prefetched into _bitBuffer
+        int realBitsRemaining = Math.Max(0, _bitsCount - _virtualBits);
+        int wholeRealBytesBuffered = realBitsRemaining / 8;
+        _offset = Math.Max(0, _offset - wholeRealBytesBuffered);
+        _bitBuffer = 0;
+        _bitsCount = 0;
+        _virtualBits = 0;
+
+        var span = _data.Span;
+        while (_offset + 1 < span.Length && span[_offset] == 0xFF)
+        {
+            byte marker = span[_offset + 1];
+            if (marker == 0xFF)
+            {
+                _offset++;
+                continue;
+            }
+            if (marker >= 0xD0 && marker <= 0xD7)
+            {
+                _offset += 2;
+            }
+            break;
+        }
+    }
+
     private byte ReadByteWithByteStuffing()
     {
-        if (_offset >= _data.Length) return 0xFF; // Pad on EOF
+        if (_offset >= _data.Length)
+        {
+            _virtualBits += 8;
+            return 0xFF; // Pad on EOF
+        }
 
         byte b = _data.Span[_offset++];
         if (b == 0xFF && _offset < _data.Length)
@@ -171,6 +204,13 @@ public sealed class JpegBitReader
             if (next == 0x00)
             {
                 _offset++; // Skip 0x00 byte stuff
+            }
+            else
+            {
+                // Marker encountered during Huffman lookahead (e.g. RST0..RST7 or EOI): pad with virtual 1-bits without consuming marker
+                _offset--;
+                _virtualBits += 8;
+                return 0xFF;
             }
         }
         return b;

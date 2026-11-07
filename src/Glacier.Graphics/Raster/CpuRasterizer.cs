@@ -38,13 +38,21 @@ public sealed class CpuRasterizer
 
         Parallel.For(0, numBands, bandIdx =>
         {
-            int startY = Math.Max((int)MathF.Floor(clipRect.Top), bandIdx * BandHeight);
+            int startY = Math.Max(0, Math.Max((int)MathF.Floor(clipRect.Top), bandIdx * BandHeight));
             int endY = Math.Min((int)MathF.Ceiling(clipRect.Bottom), Math.Min(height, (bandIdx + 1) * BandHeight));
             if (startY >= endY) return;
 
-            Span<float> coverageDeltas = stackalloc float[width + 1];
-            Span<float> areaDeltas = stackalloc float[width + 1];
+            float[]? rentedCov = null;
+            float[]? rentedArea = null;
+            Span<float> coverageDeltas = width <= 2048
+                ? stackalloc float[width + 1]
+                : (rentedCov = System.Buffers.ArrayPool<float>.Shared.Rent(width + 1)).AsSpan(0, width + 1);
+            Span<float> areaDeltas = width <= 2048
+                ? stackalloc float[width + 1]
+                : (rentedArea = System.Buffers.ArrayPool<float>.Shared.Rent(width + 1)).AsSpan(0, width + 1);
 
+            try
+            {
             for (int y = startY; y < endY; y++)
             {
                 coverageDeltas.Clear();
@@ -107,6 +115,12 @@ public sealed class CpuRasterizer
                         BlendPixel(ref rowSpan[x], color, alpha);
                     }
                 }
+            }
+            }
+            finally
+            {
+                if (rentedCov is not null) System.Buffers.ArrayPool<float>.Shared.Return(rentedCov);
+                if (rentedArea is not null) System.Buffers.ArrayPool<float>.Shared.Return(rentedArea);
             }
         });
     }

@@ -6,21 +6,23 @@
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <LangVersion>preview</LangVersion>
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <IsAotCompatible>true</IsAotCompatible>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
     <TieredPGO>true</TieredPGO>
     <ServerGarbageCollection>true</ServerGarbageCollection>
     <NoWarn>$(NoWarn);CS1591;CS8981</NoWarn>
 
     <!-- NuGet Package Properties -->
     <PackageId>Glacier.Graphics</PackageId>
-    <Version>1.0.2</Version>
+    <Version>1.1.0</Version>
     <Authors>Ian Cowley</Authors>
     <Company>Glacier High-Performance Ecosystem</Company>
-    <Description>Pure C# .NET 10 hardware-accelerated 2D vector graphics, compute rasterizer, font engine, SIMD PNG/JPEG codecs, and vector PDF generator.</Description>
+    <Description>Pure C# .NET 10 hardware-accelerated 2D vector graphics, analytical tile/CPU rasterizer, font engine, SIMD PNG/JPEG codecs, and vector PDF generator.</Description>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <PackageProjectUrl>https://github.com/ian-cowley/Glacier.Graphics</PackageProjectUrl>
     <RepositoryUrl>https://github.com/ian-cowley/Glacier.Graphics.git</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
-    <PackageTags>graphics;vector;bezier;rasterizer;simd;avx512;png;jpeg;pdf;truetype;opentype;net10;glacier</PackageTags>
+    <PackageTags>graphics;vector;bezier;rasterizer;simd;avx512;png;jpeg;pdf;truetype;opentype;net10;aot;glacier</PackageTags>
     <PackageReadmeFile>README.md</PackageReadmeFile>
   </PropertyGroup>
 

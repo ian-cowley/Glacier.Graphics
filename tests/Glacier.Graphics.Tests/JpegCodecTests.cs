@@ -59,6 +59,110 @@ public sealed class JpegCodecTests
         Assert.True(pixel.B >= 120 && pixel.B <= 136);
     }
 
+    [Fact]
+    public void JpegDecoder_Decodes420ColorJpegAcrossMultiBlockMcus()
+    {
+        // 32x16 3-component 4:2:0 JPEG (2 MCUs horizontally, each MCU = 4 Y blocks + 1 Cb + 1 Cr, with DRI=1 restart interval)
+        byte[] jpegBytes = CreateSynthetic420ColorJpeg(width: 32, height: 16);
+        using var fb = JpegDecoder.Decode(jpegBytes);
+
+        Assert.Equal(32, fb.Width);
+        Assert.Equal(16, fb.Height);
+
+        // Zero-delta DC across all blocks => Y=128, Cb=128, Cr=128 => middle gray RGB ~(128, 128, 128) across both MCUs
+        Rgba32 mcu0Pixel = fb.GetPixel(4, 4);
+        Rgba32 mcu0BottomRight = fb.GetPixel(13, 13);
+        Rgba32 mcu1Pixel = fb.GetPixel(24, 10);
+
+        Assert.InRange(mcu0Pixel.R, 120, 136);
+        Assert.InRange(mcu0Pixel.G, 120, 136);
+        Assert.InRange(mcu0Pixel.B, 120, 136);
+        Assert.InRange(mcu0BottomRight.R, 120, 136);
+        Assert.InRange(mcu1Pixel.R, 120, 136);
+        Assert.InRange(mcu1Pixel.G, 120, 136);
+        Assert.InRange(mcu1Pixel.B, 120, 136);
+    }
+
+    private static byte[] CreateSynthetic420ColorJpeg(int width, int height)
+    {
+        using var ms = new MemoryStream();
+        using var w = new BinaryWriter(ms);
+
+        // SOI
+        w.Write((byte)0xFF); w.Write((byte)0xD8);
+
+        // DQT (Table 0: flat 1s)
+        w.Write((byte)0xFF); w.Write((byte)0xDB);
+        WriteUInt16BE(w, 67);
+        w.Write((byte)0);
+        for (int i = 0; i < 64; i++) w.Write((byte)1);
+
+        // DRI (Restart interval = 1 MCU)
+        w.Write((byte)0xFF); w.Write((byte)0xDD);
+        WriteUInt16BE(w, 4);
+        WriteUInt16BE(w, 1);
+
+        // SOF0 (Baseline DCT, 3 components: Y 2x2, Cb 1x1, Cr 1x1 => 4:2:0)
+        w.Write((byte)0xFF); w.Write((byte)0xC0);
+        WriteUInt16BE(w, 17);
+        w.Write((byte)8);
+        WriteUInt16BE(w, (ushort)height);
+        WriteUInt16BE(w, (ushort)width);
+        w.Write((byte)3);
+        // Y: ID 1, H=2 V=2 (0x22), QTable 0
+        w.Write((byte)1); w.Write((byte)0x22); w.Write((byte)0);
+        // Cb: ID 2, H=1 V=1 (0x11), QTable 0
+        w.Write((byte)2); w.Write((byte)0x11); w.Write((byte)0);
+        // Cr: ID 3, H=1 V=1 (0x11), QTable 0
+        w.Write((byte)3); w.Write((byte)0x11); w.Write((byte)0);
+
+        // DHT (DC table 0: 1-bit code '0' => symbol 0)
+        w.Write((byte)0xFF); w.Write((byte)0xC4);
+        WriteUInt16BE(w, 20);
+        w.Write((byte)0x00);
+        w.Write((byte)1);
+        for (int i = 1; i < 16; i++) w.Write((byte)0);
+        w.Write((byte)0);
+
+        // DHT (AC table 0: 1-bit code '0' => EOB)
+        w.Write((byte)0xFF); w.Write((byte)0xC4);
+        WriteUInt16BE(w, 20);
+        w.Write((byte)0x10);
+        w.Write((byte)1);
+        for (int i = 1; i < 16; i++) w.Write((byte)0);
+        w.Write((byte)0);
+
+        // SOS (3 components)
+        w.Write((byte)0xFF); w.Write((byte)0xDA);
+        WriteUInt16BE(w, 12);
+        w.Write((byte)3);
+        w.Write((byte)1); w.Write((byte)0x00);
+        w.Write((byte)2); w.Write((byte)0x00);
+        w.Write((byte)3); w.Write((byte)0x00);
+        w.Write((byte)0);
+        w.Write((byte)63);
+        w.Write((byte)0);
+
+        int mcus = ((width + 15) / 16) * ((height + 15) / 16);
+        for (int m = 0; m < mcus; m++)
+        {
+            // Each 4:2:0 MCU has 6 blocks (4 Y + 1 Cb + 1 Cr) * 2 bits ('0' DC + '0' EOB) = 12 zero bits.
+            // Pad remaining 4 bits with 1s => 0x00, 0x0F.
+            w.Write((byte)0x00);
+            w.Write((byte)0x0F);
+            if (m < mcus - 1)
+            {
+                // Restart marker RST0..RST7
+                w.Write((byte)0xFF);
+                w.Write((byte)(0xD0 + (m & 7)));
+            }
+        }
+
+        // EOI
+        w.Write((byte)0xFF); w.Write((byte)0xD9);
+        return ms.ToArray();
+    }
+
     private static byte[] CreateMinimalBaselineJpeg(int width, int height)
     {
         using var ms = new MemoryStream();

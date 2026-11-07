@@ -2,6 +2,7 @@ namespace Glacier.Graphics.Raster;
 
 using System;
 using System.Collections.Generic;
+using System.Runtime.InteropServices;
 using System.Threading.Tasks;
 using Glacier.Graphics.Vector;
 
@@ -10,15 +11,15 @@ using Glacier.Graphics.Vector;
 /// </summary>
 public enum TileClassification : byte
 {
-    Empty,   // 0 segments, fully outside polygon
-    Full,    // 0 segments, fully inside filled polygon (fast solid shade)
-    Complex  // Contains 1 or more boundary segments (fine area evaluation)
+    Empty,   // 0 segments intersecting tile, outside polygon
+    Full,    // 0 segments intersecting tile, fully inside polygon (fast solid shade)
+    Complex  // Contains 1 or more boundary segments (fine analytical area evaluation with left-backdrop winding)
 }
 
 /// <summary>
 /// 16x16 Tile Compute Rasterizer executing the 3-stage analytical pipeline:
-/// Stage 1: Segment Binning into 16x16 pixel tiles
-/// Stage 2: Coarse Tile Classification (Empty, Full, Complex)
+/// Stage 1: Segment Binning into 16x16 pixel tiles (plus left-of-tile backdrop segments)
+/// Stage 2: Coarse Tile Classification (Empty, Full, Complex) supporting both CW and CCW windings
 /// Stage 3: Fine Pixel Coverage Evaluation via exact trapezoidal area integration
 /// </summary>
 public sealed class TileComputeRasterizer
@@ -49,6 +50,7 @@ public sealed class TileComputeRasterizer
         public int TileY;
         public TileClassification Classification;
         public readonly List<int> SegmentIndices = new();
+        public readonly List<int> BackdropSegmentIndices = new();
     }
 
     public void Rasterize(
@@ -57,32 +59,34 @@ public sealed class TileComputeRasterizer
         Rgba32 color,
         WindingRule rule = WindingRule.NonZero)
     {
-        if (framebuffer == null || path == null || path.PointCount < 3) return;
+        if (framebuffer == null || path == null || path.PointCount < 3 || color.A == 0) return;
 
         int tilesX = (framebuffer.Width + TileSize - 1) / TileSize;
         int tilesY = (framebuffer.Height + TileSize - 1) / TileSize;
-        int totalTiles = tilesX * tilesY;
 
         var contours = path.Flatten(0.25f);
         var segments = new List<PathSegment>();
 
         foreach (var contour in contours)
         {
-            for (int i = 0; i < contour.Count - 1; i++)
+            int count = contour.Count;
+            if (count < 2) continue;
+
+            // Emit closed contour edges consistently with CpuRasterizer so both CW and CCW contours
+            // (with or without explicit PathVerb.Close) produce watertight winding numbers.
+            for (int i = 0; i < count; i++)
             {
-                segments.Add(new PathSegment(contour[i], contour[i + 1]));
+                PointF p0 = contour[i];
+                PointF p1 = contour[(i + 1) % count];
+                if (p0 == p1) continue;
+                segments.Add(new PathSegment(p0, p1));
             }
         }
 
         if (segments.Count == 0) return;
 
-        // Stage 1: Segment Binning
         TileData[] tiles = Stage1_BinSegments(tilesX, tilesY, segments);
-
-        // Stage 2: Coarse Tile Classification
         Stage2_ClassifyTiles(tiles, tilesX, tilesY, contours, rule);
-
-        // Stage 3: Fine Pixel Coverage Evaluation & Blending
         Stage3_EvaluateCoverage(framebuffer, tiles, tilesX, tilesY, segments, color, rule);
     }
 
@@ -102,17 +106,41 @@ public sealed class TileComputeRasterizer
         for (int s = 0; s < segments.Count; s++)
         {
             var seg = segments[s];
-            int minTX = Math.Clamp((int)MathF.Floor(seg.Bounds.Left / TileSize), 0, tilesX - 1);
-            int maxTX = Math.Clamp((int)MathF.Floor(seg.Bounds.Right / TileSize), 0, tilesX - 1);
+            if (MathF.Abs(seg.P0.Y - seg.P1.Y) < 1e-6f && seg.Bounds.Top == seg.Bounds.Bottom)
+            {
+                // Horizontal segment still marks boundary tiles Complex so interior/exterior split tiles aren't misclassified Full
+            }
+
+            if (seg.Bounds.Bottom <= 0f || seg.Bounds.Top >= tilesY * TileSize)
+            {
+                continue;
+            }
+
             int minTY = Math.Clamp((int)MathF.Floor(seg.Bounds.Top / TileSize), 0, tilesY - 1);
-            int maxTY = Math.Clamp((int)MathF.Floor(seg.Bounds.Bottom / TileSize), 0, tilesY - 1);
+            int maxTY = Math.Clamp((int)MathF.Floor(MathF.Max(seg.Bounds.Top, MathF.BitDecrement(seg.Bounds.Bottom)) / TileSize), 0, tilesY - 1);
+
+            int rawMinTX = (int)MathF.Floor(seg.Bounds.Left / TileSize);
+            int rawMaxTX = (int)MathF.Floor(seg.Bounds.Right / TileSize);
 
             for (int ty = minTY; ty <= maxTY; ty++)
             {
                 int rowOffset = ty * tilesX;
-                for (int tx = minTX; tx <= maxTX; tx++)
+
+                if (rawMaxTX >= 0 && rawMinTX < tilesX)
                 {
-                    tiles[rowOffset + tx].SegmentIndices.Add(s);
+                    int minTX = Math.Clamp(rawMinTX, 0, tilesX - 1);
+                    int maxTX = Math.Clamp(rawMaxTX, 0, tilesX - 1);
+                    for (int tx = minTX; tx <= maxTX; tx++)
+                    {
+                        tiles[rowOffset + tx].SegmentIndices.Add(s);
+                    }
+                }
+
+                // Any tile strictly to the right of rawMaxTX on this tile row receives this segment's left-backdrop winding
+                int backdropStartTX = Math.Max(0, rawMaxTX + 1);
+                for (int tx = backdropStartTX; tx < tilesX; tx++)
+                {
+                    tiles[rowOffset + tx].BackdropSegmentIndices.Add(s);
                 }
             }
         }
@@ -136,15 +164,14 @@ public sealed class TileComputeRasterizer
             }
             else
             {
-                // Test tile center for containment
                 float centerX = (tile.TileX + 0.5f) * TileSize;
                 float centerY = (tile.TileY + 0.5f) * TileSize;
-                PointF center = new PointF(centerX, centerY);
+                PointF center = new(centerX, centerY);
 
                 int totalWinding = 0;
                 foreach (var contour in contours)
                 {
-                    totalWinding += PolygonClipper.ComputeWindingNumber(center, contour.ToArray());
+                    totalWinding += PolygonClipper.ComputeWindingNumber(center, CollectionsMarshal.AsSpan(contour));
                 }
 
                 bool isInside = rule switch
@@ -178,7 +205,6 @@ public sealed class TileComputeRasterizer
 
             if (tile.Classification == TileClassification.Full)
             {
-                // Solid fast shade entire 16x16 tile
                 for (int py = 0; py < TileSize; py++)
                 {
                     int y = startPixelY + py;
@@ -195,7 +221,6 @@ public sealed class TileComputeRasterizer
                 return;
             }
 
-            // Complex Tile: evaluate per-pixel analytical trapezoidal coverage
             Span<float> coverageDeltas = stackalloc float[TileSize + 1];
             Span<float> areaDeltas = stackalloc float[TileSize + 1];
 
@@ -210,14 +235,29 @@ public sealed class TileComputeRasterizer
                 float lineTop = y;
                 float lineBottom = y + 1.0f;
 
-                // Accumulate trapezoidal coverage deltas for segments crossing this pixel row
+                // 1. Accumulate exact left-of-tile backdrop winding from segments strictly to the left of this tile
+                for (int b = 0; b < tile.BackdropSegmentIndices.Count; b++)
+                {
+                    var seg = segments[tile.BackdropSegmentIndices[b]];
+                    if (seg.Bounds.Bottom <= lineTop || seg.Bounds.Top >= lineBottom)
+                        continue;
+
+                    float clampedY1 = Math.Clamp(seg.P0.Y, lineTop, lineBottom);
+                    float clampedY2 = Math.Clamp(seg.P1.Y, lineTop, lineBottom);
+                    float signedDy = clampedY2 - clampedY1;
+                    if (MathF.Abs(signedDy) < 1e-5f) continue;
+
+                    areaDeltas[0] += signedDy;
+                    coverageDeltas[0] += signedDy;
+                }
+
+                // 2. Accumulate boundary segments intersecting this tile
                 for (int s = 0; s < tile.SegmentIndices.Count; s++)
                 {
                     var seg = segments[tile.SegmentIndices[s]];
                     if (seg.Bounds.Bottom <= lineTop || seg.Bounds.Top >= lineBottom)
                         continue;
 
-                    // Clip segment Y to [lineTop, lineBottom]
                     float y1 = seg.P0.Y;
                     float y2 = seg.P1.Y;
                     float x1 = seg.P0.X;
@@ -238,7 +278,6 @@ public sealed class TileComputeRasterizer
                         clampedX1, clampedY1 - lineTop, clampedX2, clampedY2 - lineTop);
                 }
 
-                // Prefix sum to integrate pixel coverage across scanline
                 var row = fb.GetRowSpan(y);
                 float accumCoverage = 0f;
 
@@ -250,7 +289,13 @@ public sealed class TileComputeRasterizer
                     float pixelArea = accumCoverage + areaDeltas[px];
                     accumCoverage += coverageDeltas[px];
 
-                    float alpha = Math.Clamp(MathF.Abs(pixelArea), 0f, 1f);
+                    float alpha = rule switch
+                    {
+                        WindingRule.NonZero => Math.Clamp(MathF.Abs(pixelArea), 0f, 1f),
+                        WindingRule.EvenOdd => Math.Clamp(MathF.Abs(pixelArea - 2.0f * MathF.Round(pixelArea * 0.5f)), 0f, 1f),
+                        _ => Math.Clamp(MathF.Abs(pixelArea), 0f, 1f)
+                    };
+
                     if (alpha > 0.001f)
                     {
                         BlendPixel(ref row[x], color, alpha);

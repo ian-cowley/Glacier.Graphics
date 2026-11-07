@@ -33,7 +33,6 @@ public enum PdfBlendMode
 public sealed class PdfPage
 {
     private readonly MemoryStream _contentStream = new();
-    private readonly List<string> _fontsUsed = new();
     private readonly Dictionary<string, (float Alpha, PdfBlendMode Mode)> _extGStates = new();
 
     public float Width { get; }
@@ -41,6 +40,7 @@ public sealed class PdfPage
 
     internal int PageObjectNumber { get; set; }
     internal int ContentObjectNumber { get; set; }
+    internal bool UsesStandardFallbackFont { get; set; }
 
     public PdfPage(float width = 612f, float height = 792f) // Default US Letter (points)
     {
@@ -50,8 +50,15 @@ public sealed class PdfPage
 
     internal void AppendCommand(string cmd)
     {
-        byte[] bytes = Encoding.ASCII.GetBytes(cmd + "\n");
+        // Use Latin1 (1:1 single-byte mapping 0x00..0xFF) instead of ASCII so bytes >= 0x80 are never mangled into '?' (0x3F).
+        byte[] bytes = Encoding.Latin1.GetBytes(cmd);
         _contentStream.Write(bytes, 0, bytes.Length);
+        _contentStream.WriteByte((byte)'\n');
+    }
+
+    internal void AppendBytes(ReadOnlySpan<byte> rawBytes)
+    {
+        _contentStream.Write(rawBytes);
     }
 
     internal string RegisterExtGState(float alpha, PdfBlendMode mode)
@@ -65,6 +72,8 @@ public sealed class PdfPage
     }
 
     internal IReadOnlyDictionary<string, (float Alpha, PdfBlendMode Mode)> ExtGStates => _extGStates;
+
+    internal byte[] GetRawContent() => _contentStream.ToArray();
 
     internal byte[] GetCompressedContent()
     {
@@ -80,7 +89,7 @@ public sealed class PdfPage
 
 /// <summary>
 /// High-throughput PDF 1.7 / 2.0 document generator with Flate stream compression,
-/// vector paths, embedded TrueType fonts, and ExtGState transparency.
+/// vector paths, embedded TrueType fonts, lossless RGB image embedding, and ExtGState transparency.
 /// </summary>
 public sealed class PdfDocument
 {
@@ -105,6 +114,23 @@ public sealed class PdfDocument
         }
     }
 
+    internal string ResolveFontResourceName(TrueTypeFont? font, PdfPage page)
+    {
+        if (font == null)
+        {
+            page.UsesStandardFallbackFont = true;
+            return "F0";
+        }
+
+        int idx = _embeddedFonts.IndexOf(font);
+        if (idx < 0)
+        {
+            _embeddedFonts.Add(font);
+            idx = _embeddedFonts.Count - 1;
+        }
+        return $"F{idx + 1}";
+    }
+
     public byte[] Save()
     {
         using var ms = new MemoryStream();
@@ -114,41 +140,42 @@ public sealed class PdfDocument
 
     public void Save(Stream output)
     {
-        using var writer = new StreamWriter(output, Encoding.ASCII, leaveOpen: true);
+        // Use Latin1 so the 4 high-bit PDF binary header bytes (%\xE2\xE3\xCF\xD3) are preserved verbatim.
+        using var writer = new StreamWriter(output, Encoding.Latin1, leaveOpen: true);
         _objectOffsets.Clear();
-        _objectOffsets.Add(0); // Object 0 is dummy
+        _objectOffsets.Add(0); // Object 0 is free root entry
 
-        // 1. PDF Header (PDF 1.7 standard)
         writer.Write("%PDF-1.7\n");
-        writer.Write("%\xE2\xE3\xCF\xD3\n"); // Binary marker
+        writer.Write("%\u00E2\u00E3\u00CF\u00D3\n");
         writer.Flush();
 
         int nextObj = 1;
-
-        // Reserve object numbers
         int catalogObj = nextObj++;
         int pagesObj = nextObj++;
 
-        // Assign object numbers to pages and content streams
+        bool anyFallbackFont = false;
         for (int i = 0; i < _pages.Count; i++)
         {
             _pages[i].PageObjectNumber = nextObj++;
             _pages[i].ContentObjectNumber = nextObj++;
+            if (_pages[i].UsesStandardFallbackFont)
+            {
+                anyFallbackFont = true;
+            }
         }
 
-        // Embedded fonts object allocation
+        int fallbackHelveticaObj = anyFallbackFont ? nextObj++ : 0;
+
         var fontObjMap = new Dictionary<TrueTypeFont, (int FontObj, int FileObj)>();
         foreach (var font in _embeddedFonts)
         {
             fontObjMap[font] = (nextObj++, nextObj++);
         }
 
-        // Write Catalog
         WriteObjectHeader(writer, output, catalogObj);
         writer.Write($"<< /Type /Catalog /Pages {pagesObj} 0 R >>\nendobj\n");
         writer.Flush();
 
-        // Write Pages Tree
         WriteObjectHeader(writer, output, pagesObj);
         writer.Write("<< /Type /Pages /Kids [");
         foreach (var p in _pages)
@@ -158,27 +185,34 @@ public sealed class PdfDocument
         writer.Write($"] /Count {_pages.Count} >>\nendobj\n");
         writer.Flush();
 
-        // Write Pages & Contents
+        if (anyFallbackFont)
+        {
+            WriteObjectHeader(writer, output, fallbackHelveticaObj);
+            writer.Write("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>\nendobj\n");
+            writer.Flush();
+        }
+
         for (int i = 0; i < _pages.Count; i++)
         {
             var page = _pages[i];
 
-            // Write Page Object
             WriteObjectHeader(writer, output, page.PageObjectNumber);
             writer.Write($"<< /Type /Page /Parent {pagesObj} 0 R\n");
             writer.Write(string.Format(CultureInfo.InvariantCulture, "/MediaBox [0 0 {0:0.##} {1:0.##}]\n", page.Width, page.Height));
             writer.Write($"/Contents {page.ContentObjectNumber} 0 R\n");
 
-            // Resources
             writer.Write("/Resources << /Font << ");
-            int fontIdx = 1;
-            foreach (var kvp in fontObjMap)
+            if (page.UsesStandardFallbackFont)
             {
-                writer.Write($"/F{fontIdx++} {kvp.Value.FontObj} 0 R ");
+                writer.Write($"/F0 {fallbackHelveticaObj} 0 R ");
+            }
+            for (int f = 0; f < _embeddedFonts.Count; f++)
+            {
+                var info = fontObjMap[_embeddedFonts[f]];
+                writer.Write($"/F{f + 1} {info.FontObj} 0 R ");
             }
             writer.Write(">> ");
 
-            // ExtGState transparency resources
             if (page.ExtGStates.Count > 0)
             {
                 writer.Write("/ExtGState << ");
@@ -195,7 +229,6 @@ public sealed class PdfDocument
             writer.Write(">> >>\nendobj\n");
             writer.Flush();
 
-            // Write Content Stream Object
             byte[] compressed = page.GetCompressedContent();
             WriteObjectHeader(writer, output, page.ContentObjectNumber);
             writer.Write($"<< /Length {compressed.Length} /Filter /FlateDecode >>\nstream\n");
@@ -205,7 +238,6 @@ public sealed class PdfDocument
             writer.Flush();
         }
 
-        // Write Embedded Fonts
         foreach (var kvp in fontObjMap)
         {
             var font = kvp.Key;
@@ -213,7 +245,6 @@ public sealed class PdfDocument
 
             ReadOnlyMemory<byte> fontBytes = font.FontData;
 
-            // Write FontFile2 stream
             WriteObjectHeader(writer, output, fileObj);
             writer.Write($"<< /Length {fontBytes.Length} /Length1 {fontBytes.Length} >>\nstream\n");
             writer.Flush();
@@ -221,7 +252,6 @@ public sealed class PdfDocument
             writer.Write("\nendstream\nendobj\n");
             writer.Flush();
 
-            // Write TrueType Font Object
             WriteObjectHeader(writer, output, fontObj);
             writer.Write("<< /Type /Font /Subtype /TrueType\n");
             writer.Write("/BaseFont /GlacierFont\n");
@@ -240,7 +270,6 @@ public sealed class PdfDocument
             writer.Flush();
         }
 
-        // Write Cross-Reference Table (xref)
         long xrefStart = output.Position;
         writer.Write($"xref\n0 {_objectOffsets.Count}\n");
         writer.Write("0000000000 65535 f \n");
@@ -249,7 +278,6 @@ public sealed class PdfDocument
             writer.Write(string.Format(CultureInfo.InvariantCulture, "{0:D10} 00000 n \n", _objectOffsets[i]));
         }
 
-        // Write Trailer
         writer.Write("trailer\n");
         writer.Write($"<< /Size {_objectOffsets.Count} /Root {catalogObj} 0 R >>\n");
         writer.Write($"startxref\n{xrefStart}\n%%EOF\n");

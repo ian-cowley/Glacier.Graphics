@@ -124,7 +124,7 @@ public sealed class CpuGraphicsCanvas : IGraphicsCanvas
                 for (int gy = 0; gy < gHeight; gy++)
                 {
                     int py = dstY + gy;
-                    if (py < _currentState.Clip.Top || py >= _currentState.Clip.Bottom || py >= _framebuffer.Height)
+                    if (py < 0 || py < _currentState.Clip.Top || py >= _currentState.Clip.Bottom || py >= _framebuffer.Height)
                         continue;
 
                     var row = _framebuffer.GetRowSpan(py);
@@ -133,7 +133,7 @@ public sealed class CpuGraphicsCanvas : IGraphicsCanvas
                     for (int gx = 0; gx < gWidth; gx++)
                     {
                         int px = dstX + gx;
-                        if (px < _currentState.Clip.Left || px >= _currentState.Clip.Right || px >= _framebuffer.Width)
+                        if (px < 0 || px < _currentState.Clip.Left || px >= _currentState.Clip.Right || px >= _framebuffer.Width)
                             continue;
 
                         byte coverage = atlasPixels[atlasRow + gx];
@@ -154,10 +154,10 @@ public sealed class CpuGraphicsCanvas : IGraphicsCanvas
     {
         if (image.Width <= 0 || image.Height <= 0 || width <= 0f || height <= 0f) return;
 
-        int dstMinX = Math.Max((int)MathF.Floor(x), (int)MathF.Floor(_currentState.Clip.Left));
-        int dstMaxX = Math.Min((int)MathF.Ceiling(x + width), (int)MathF.Ceiling(_currentState.Clip.Right));
-        int dstMinY = Math.Max((int)MathF.Floor(y), (int)MathF.Floor(_currentState.Clip.Top));
-        int dstMaxY = Math.Min((int)MathF.Ceiling(y + height), (int)MathF.Ceiling(_currentState.Clip.Bottom));
+        int dstMinX = Math.Max(0, Math.Max((int)MathF.Floor(x), (int)MathF.Floor(_currentState.Clip.Left)));
+        int dstMaxX = Math.Min(_framebuffer.Width, Math.Min((int)MathF.Ceiling(x + width), (int)MathF.Ceiling(_currentState.Clip.Right)));
+        int dstMinY = Math.Max(0, Math.Max((int)MathF.Floor(y), (int)MathF.Floor(_currentState.Clip.Top)));
+        int dstMaxY = Math.Min(_framebuffer.Height, Math.Min((int)MathF.Ceiling(y + height), (int)MathF.Ceiling(_currentState.Clip.Bottom)));
 
         float scaleX = image.Width / width;
         float scaleY = image.Height / height;

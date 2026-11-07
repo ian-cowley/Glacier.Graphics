@@ -7,8 +7,8 @@ using Glacier.Graphics.Text;
 using Glacier.Graphics.Vector;
 
 /// <summary>
-/// Vector PDF graphics canvas implementing IGraphicsCanvas.
-/// Emits resolution-independent vector PDF drawing operators directly to a PdfPage.
+/// Vector PDF graphics canvas implementing <see cref="IGraphicsCanvas"/>.
+/// Emits resolution-independent vector PDF drawing operators directly to a <see cref="PdfPage"/>.
 /// </summary>
 public sealed class PdfGraphicsCanvas : IGraphicsCanvas
 {
@@ -41,7 +41,6 @@ public sealed class PdfGraphicsCanvas : IGraphicsCanvas
         SetStrokeColor(paint.Color);
         _page.AppendCommand(string.Format(CultureInfo.InvariantCulture, "{0:0.##} w", paint.StrokeWidth));
 
-        // Line cap
         int capVal = paint.Cap switch
         {
             StrokeCap.Butt => 0,
@@ -51,7 +50,6 @@ public sealed class PdfGraphicsCanvas : IGraphicsCanvas
         };
         _page.AppendCommand($"{capVal} J");
 
-        // Line join
         int joinVal = paint.Join switch
         {
             StrokeJoin.Miter => 0,
@@ -81,26 +79,22 @@ public sealed class PdfGraphicsCanvas : IGraphicsCanvas
     {
         if (text.IsEmpty || paint.Color.A == 0) return;
 
-        if (font.Typeface != null)
-        {
-            _document.EmbedFont(font.Typeface);
-        }
+        string fontResName = _document.ResolveFontResourceName(font.Typeface, _page);
 
         SetAlpha(paint.Color.A / 255.0f);
         SetFillColor(paint.Color);
 
-        // PDF coordinates: Y is measured from bottom up
         float pdfY = _page.Height - y;
 
         _page.AppendCommand("BT");
-        _page.AppendCommand(string.Format(CultureInfo.InvariantCulture, "/F1 {0:0.##} Tf", font.Size));
+        _page.AppendCommand(string.Format(CultureInfo.InvariantCulture, "/{0} {1:0.##} Tf", fontResName, font.Size));
         _page.AppendCommand(string.Format(CultureInfo.InvariantCulture, "1 0 0 1 {0:0.##} {1:0.##} Tm", x, pdfY));
 
         var sb = new StringBuilder("(");
         foreach (char c in text)
         {
             if (c == '(' || c == ')' || c == '\\') sb.Append('\\');
-            sb.Append(c);
+            sb.Append(c <= 0xFF ? c : '?');
         }
         sb.Append(") Tj");
 
@@ -110,30 +104,37 @@ public sealed class PdfGraphicsCanvas : IGraphicsCanvas
 
     public void DrawImage(in ReadOnlySpan2D<Rgba32> image, float x, float y, float width, float height)
     {
-        // Vector PDF image embedding fallback (inline image operator or placeholder)
-        if (image.Width <= 0 || image.Height <= 0) return;
+        if (image.Width <= 0 || image.Height <= 0 || width <= 0f || height <= 0f) return;
 
         float pdfY = _page.Height - y - height;
         _page.AppendCommand("q");
         _page.AppendCommand(string.Format(CultureInfo.InvariantCulture, "{0:0.##} 0 0 {1:0.##} {2:0.##} {3:0.##} cm", width, height, x, pdfY));
         _page.AppendCommand("BI");
-        _page.AppendCommand($"/W {image.Width} /H {image.Height} /CS /DeviceRGB /BPC 8");
+        _page.AppendCommand($"/W {image.Width} /H {image.Height} /CS /RGB /BPC 8 /F /AHx");
         _page.AppendCommand("ID");
 
-        // Emit inline RGB bytes
-        var bytes = new byte[image.Width * image.Height * 3];
-        int idx = 0;
+        // Emit lossless ASCIIHexDecode RGB stream (immune to >=128 ASCII truncation and inline 'EI' token collisions)
+        ReadOnlySpan<byte> hexLut = "0123456789ABCDEF"u8;
+        byte[] hexRow = new byte[image.Width * 6 + 1];
         for (int row = 0; row < image.Height; row++)
         {
             var rSpan = image.GetRowSpan(row);
+            int pos = 0;
             for (int col = 0; col < image.Width; col++)
             {
-                bytes[idx++] = rSpan[col].R;
-                bytes[idx++] = rSpan[col].G;
-                bytes[idx++] = rSpan[col].B;
+                Rgba32 px = rSpan[col];
+                hexRow[pos++] = hexLut[px.R >> 4];
+                hexRow[pos++] = hexLut[px.R & 0x0F];
+                hexRow[pos++] = hexLut[px.G >> 4];
+                hexRow[pos++] = hexLut[px.G & 0x0F];
+                hexRow[pos++] = hexLut[px.B >> 4];
+                hexRow[pos++] = hexLut[px.B & 0x0F];
             }
+            hexRow[pos++] = (byte)'\n';
+            _page.AppendBytes(hexRow.AsSpan(0, pos));
         }
-        _page.AppendCommand(Encoding.Latin1.GetString(bytes));
+
+        _page.AppendCommand(">");
         _page.AppendCommand("EI");
         _page.AppendCommand("Q");
     }
@@ -209,7 +210,6 @@ public sealed class PdfGraphicsCanvas : IGraphicsCanvas
                 {
                     PointF p1 = path.Points[ptIdx++];
                     PointF p2 = path.Points[ptIdx++];
-                    // Elevate quadratic to cubic Bézier: c1 = p0 + 2/3(p1 - p0), c2 = p2 + 2/3(p1 - p2)
                     PointF p0 = path.Points[ptIdx - 3];
                     PointF c1 = p0 + (p1 - p0) * (2f / 3f);
                     PointF c2 = p2 + (p1 - p2) * (2f / 3f);

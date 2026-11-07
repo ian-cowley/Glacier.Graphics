@@ -4,19 +4,47 @@ on:
   push:
     branches: [master, main]
     tags: ['v*']
+  pull_request:
+    branches: [master, main]
   workflow_dispatch:
 
+env:
+  DOTNET_CLI_TELEMETRY_OPTOUT: 1
+  DOTNET_NOLOGO: 1
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
-  build:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET 10
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Restore dependencies
+        run: dotnet restore Glacier.Graphics.slnx
+
+      - name: Build
+        run: dotnet build Glacier.Graphics.slnx --configuration Release --no-restore
+
+      - name: Run tests
+        run: dotnet test tests/Glacier.Graphics.Tests/Glacier.Graphics.Tests.csproj --configuration Release --no-restore --no-build --blame-hang --blame-hang-dump-type none --blame-hang-timeout 60s
+
+  publish:
+    needs: test
+    if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))
     runs-on: ubuntu-latest
     permissions:
       contents: write
       packages: write
-    env:
-      DOTNET_CLI_TELEMETRY_OPTOUT: 1
-      NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-
+      id-token: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -30,27 +58,17 @@ jobs:
       - name: Pack Glacier.Graphics
         run: dotnet pack src/Glacier.Graphics/Glacier.Graphics.csproj --configuration Release --output packages
 
-      - name: Restore dependencies
-        run: dotnet restore
-
-      - name: Build
-        run: dotnet build --configuration Release --no-restore
-
-      - name: Run tests
-        run: |
-          if [ -f tests/Glacier.Graphics.Tests/Glacier.Graphics.Tests.csproj ]; then
-            dotnet test tests/Glacier.Graphics.Tests/Glacier.Graphics.Tests.csproj --configuration Release --no-restore --no-build
-          else
-            echo "No test project found, skipping tests."
-          fi
+      - name: Authenticate with NuGet.org via OIDC Trusted Publishing
+        uses: NuGet/login@v1
+        id: login
+        with:
+          user: spuriousbugfix
 
       - name: Publish to nuget.org
-        if: env.NUGET_API_KEY != '' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))
-        run: dotnet nuget push "packages/*.nupkg" --api-key $NUGET_API_KEY --source https://api.nuget.org/v3/index.json --skip-duplicate || true
+        run: dotnet nuget push "packages/*.nupkg" --api-key ${{ steps.login.outputs.NUGET_API_KEY }} --source https://api.nuget.org/v3/index.json --skip-duplicate
 
       - name: Publish to GitHub Packages
-        if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')
-        run: dotnet nuget push "packages/*.nupkg" --api-key ${{ secrets.GITHUB_TOKEN }} --source https://nuget.pkg.github.com/${{ github.repository_owner }}/index.json --skip-duplicate || true
+        run: dotnet nuget push "packages/*.nupkg" --api-key ${{ secrets.GITHUB_TOKEN }} --source https://nuget.pkg.github.com/${{ github.repository_owner }}/index.json --skip-duplicate
 
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
