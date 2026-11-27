@@ -261,8 +261,22 @@ public sealed class VectorPath
         return contours;
     }
 
-    private static void FlattenQuad(List<PointF> output, PointF p0, PointF p1, PointF p2, float tolerance)
+    private const int MaxFlattenDepth = 16;
+
+    private static void FlattenQuad(List<PointF> output, PointF p0, PointF p1, PointF p2, float tolerance, int depth = 0)
     {
+        if (!float.IsFinite(p0.X) || !float.IsFinite(p0.Y) ||
+            !float.IsFinite(p1.X) || !float.IsFinite(p1.Y) ||
+            !float.IsFinite(p2.X) || !float.IsFinite(p2.Y) ||
+            depth >= MaxFlattenDepth)
+        {
+            if (float.IsFinite(p2.X) && float.IsFinite(p2.Y))
+            {
+                output.Add(p2);
+            }
+            return;
+        }
+
         // De Casteljau subdivision based on flatness
         float dx = p2.X - p0.X;
         float dy = p2.Y - p0.Y;
@@ -277,12 +291,25 @@ public sealed class VectorPath
         PointF p12 = (p1 + p2) * 0.5f;
         PointF p012 = (p01 + p12) * 0.5f;
 
-        FlattenQuad(output, p0, p01, p012, tolerance);
-        FlattenQuad(output, p012, p12, p2, tolerance);
+        FlattenQuad(output, p0, p01, p012, tolerance, depth + 1);
+        FlattenQuad(output, p012, p12, p2, tolerance, depth + 1);
     }
 
-    private static void FlattenCubic(List<PointF> output, PointF p0, PointF p1, PointF p2, PointF p3, float tolerance)
+    private static void FlattenCubic(List<PointF> output, PointF p0, PointF p1, PointF p2, PointF p3, float tolerance, int depth = 0)
     {
+        if (!float.IsFinite(p0.X) || !float.IsFinite(p0.Y) ||
+            !float.IsFinite(p1.X) || !float.IsFinite(p1.Y) ||
+            !float.IsFinite(p2.X) || !float.IsFinite(p2.Y) ||
+            !float.IsFinite(p3.X) || !float.IsFinite(p3.Y) ||
+            depth >= MaxFlattenDepth)
+        {
+            if (float.IsFinite(p3.X) && float.IsFinite(p3.Y))
+            {
+                output.Add(p3);
+            }
+            return;
+        }
+
         // Subdivide if control points deviate from chord line
         float dx = p3.X - p0.X;
         float dy = p3.Y - p0.Y;
@@ -303,8 +330,8 @@ public sealed class VectorPath
         PointF p123 = (p12 + p23) * 0.5f;
         PointF p0123 = (p012 + p123) * 0.5f;
 
-        FlattenCubic(output, p0, p01, p012, p0123, tolerance);
-        FlattenCubic(output, p0123, p123, p23, p3, tolerance);
+        FlattenCubic(output, p0, p01, p012, p0123, tolerance, depth + 1);
+        FlattenCubic(output, p0123, p123, p23, p3, tolerance, depth + 1);
     }
 
     private void EnsureVerbCapacity(int additional)

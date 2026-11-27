@@ -587,4 +587,31 @@ public class TinyPdfTests
         Assert.DoesNotContain("\xE2\x82\xAC", latin1); // No UTF-8 Euro mojibake
         Assert.DoesNotContain("\xE2\x80\x94", latin1); // No UTF-8 Em-dash mojibake
     }
+
+    [Fact]
+    public void PooledBufferWriter_MultiBlockEarlySwitch_DoesNotLeakStalePoolBytes()
+    {
+        using var writer = new TinyPdfCreate.PooledBufferWriter();
+        byte[] first = new byte[6000];
+        Array.Fill(first, (byte)0x41);
+        var s1 = writer.GetSpan(first.Length);
+        first.CopyTo(s1);
+        writer.Advance(first.Length);
+
+        // Request 4000 bytes -> forces switching to block 2 with 2192+ unused tail bytes in block 1
+        byte[] second = new byte[4000];
+        Array.Fill(second, (byte)0x42);
+        var s2 = writer.GetSpan(second.Length);
+        second.CopyTo(s2);
+        writer.Advance(second.Length);
+
+        using var outMs = new MemoryStream();
+        writer.CopyTo(outMs);
+        byte[] result = outMs.ToArray();
+
+        Assert.Equal(10000, writer.WrittenCount);
+        Assert.Equal(10000, result.Length);
+        Assert.All(result.AsSpan(0, 6000).ToArray(), b => Assert.Equal((byte)0x41, b));
+        Assert.All(result.AsSpan(6000, 4000).ToArray(), b => Assert.Equal((byte)0x42, b));
+    }
 }

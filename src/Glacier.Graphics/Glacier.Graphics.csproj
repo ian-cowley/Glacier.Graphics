@@ -14,7 +14,8 @@
 
     <!-- NuGet Package Properties -->
     <PackageId>Glacier.Graphics</PackageId>
-    <Version>1.2.0</Version>
+    <Version>1.2.1</Version>
+    <PackageReleaseNotes>v1.2.1: Rasterization, buffer pool, and vector path stability hardening.</PackageReleaseNotes>
     <Authors>Ian Cowley</Authors>
     <Company>Glacier High-Performance Ecosystem</Company>
     <Description>Pure C# .NET 10 hardware-accelerated 2D vector graphics, analytical tile/CPU rasterizer, font engine, SIMD PNG/JPEG codecs, and vector PDF generator.</Description>

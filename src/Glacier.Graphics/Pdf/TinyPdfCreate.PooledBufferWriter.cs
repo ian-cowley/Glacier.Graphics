@@ -9,6 +9,7 @@ public partial class TinyPdfCreate
     {
         private const int DefaultBlockSize = 8192;
         private readonly List<byte[]> _blocks = new List<byte[]>();
+        private readonly List<int> _blockLengths = new List<int>();
         private int _posInLast = 0;
         private int _written = 0;
 
@@ -25,9 +26,14 @@ public partial class TinyPdfCreate
             int needed = Math.Max(1, sizeHint);
             if (_blocks.Count == 0 || (_blocks[_blocks.Count - 1].Length - _posInLast < needed))
             {
+                if (_blocks.Count > 0)
+                {
+                    _blockLengths[_blocks.Count - 1] = _posInLast;
+                }
                 int newSize = Math.Max(DefaultBlockSize, needed);
                 var buf = ArrayPool<byte>.Shared.Rent(newSize);
                 _blocks.Add(buf);
+                _blockLengths.Add(0);
                 _posInLast = 0;
             }
         }
@@ -52,7 +58,7 @@ public partial class TinyPdfCreate
             for (int i = 0; i < _blocks.Count; i++)
             {
                 var block = _blocks[i];
-                int count = (i == _blocks.Count - 1) ? _posInLast : block.Length;
+                int count = (i == _blocks.Count - 1) ? _posInLast : _blockLengths[i];
                 if (count > 0) dest.Write(block, 0, count);
             }
         }
@@ -64,6 +70,7 @@ public partial class TinyPdfCreate
                 ArrayPool<byte>.Shared.Return(b);
             }
             _blocks.Clear();
+            _blockLengths.Clear();
             _posInLast = 0;
             _written = 0;
         }

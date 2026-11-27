@@ -96,4 +96,16 @@ public sealed class VectorPathAndStrokingTests
 
         Assert.True(dashedStroked.VerbCount > 4); // Multiple dashed sub-contours
     }
+
+    [Fact]
+    public void VectorPath_Flatten_TerminatesSafelyOnNonFiniteAndZeroTolerance()
+    {
+        var path = new VectorPath();
+        path.MoveTo(0f, 0f);
+        path.CubicTo(50f, 100f, 150f, -100f, 200f, 0f);
+        path.QuadTo(float.NaN, 10f, 300f, 0f);
+
+        var flattened = path.Flatten(tolerance: 0f);
+        Assert.NotEmpty(flattened);
+    }
 }

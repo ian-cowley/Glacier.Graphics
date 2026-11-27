@@ -16,10 +16,10 @@ public static class JpegAanIdct
     private static float[] CreateAanScales()
     {
         float[] s = new float[8];
-        s[0] = 1.0f / (2.0f * MathF.Sqrt(2.0f));
+        s[0] = 1.0f;
         for (int k = 1; k < 8; k++)
         {
-            s[k] = 1.0f / (4.0f * MathF.Cos(k * MathF.PI / 16.0f));
+            s[k] = MathF.Sqrt(2.0f) * MathF.Cos(k * MathF.PI / 16.0f);
         }
         return s;
     }
@@ -31,6 +31,17 @@ public static class JpegAanIdct
     public static void Transform8x8(Span<float> block)
     {
         if (block.Length < 64) throw new ArgumentException("Block must contain 64 coefficients.");
+
+        // Apply 2D AAN pre-scale factors before 1D row/col passes
+        for (int r = 0; r < 8; r++)
+        {
+            float sr = AanScales[r];
+            int rowBase = r * 8;
+            for (int c = 0; c < 8; c++)
+            {
+                block[rowBase + c] *= sr * AanScales[c];
+            }
+        }
 
         // Row pass: 8 1D IDCTs (unscaled)
         for (int row = 0; row < 8; row++)
@@ -90,7 +101,7 @@ public static class JpegAanIdct
 
         float tmp6_odd = tmp12_odd - tmp7_odd;
         float tmp5_odd = tmp11_odd - tmp6_odd;
-        float tmp4_odd = tmp10_odd + tmp5_odd;
+        float tmp4_odd = -(tmp10_odd + tmp5_odd);
 
         float scale = scaleByEighth ? 0.125f : 1.0f;
 

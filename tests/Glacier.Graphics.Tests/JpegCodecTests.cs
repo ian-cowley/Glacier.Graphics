@@ -28,6 +28,44 @@ public sealed class JpegCodecTests
     }
 
     [Fact]
+    public void AanIdct_AcBlock_MatchesExact2DIdct()
+    {
+        Span<float> coeffs = stackalloc float[64];
+        coeffs.Clear();
+        coeffs[0] = 400f;
+        coeffs[1] = 120f;
+        coeffs[8] = -80f;
+        coeffs[9] = 45f;
+        coeffs[19] = -30f;
+
+        Span<float> actual = stackalloc float[64];
+        coeffs.CopyTo(actual);
+        JpegAanIdct.Transform8x8(actual);
+
+        for (int y = 0; y < 8; y++)
+        {
+            for (int x = 0; x < 8; x++)
+            {
+                double sum = 0.0;
+                for (int u = 0; u < 8; u++)
+                {
+                    double cu = u == 0 ? 1.0 / Math.Sqrt(2.0) : 1.0;
+                    double cosY = Math.Cos((2 * y + 1) * u * Math.PI / 16.0);
+                    for (int v = 0; v < 8; v++)
+                    {
+                        double cv = v == 0 ? 1.0 / Math.Sqrt(2.0) : 1.0;
+                        double cosX = Math.Cos((2 * x + 1) * v * Math.PI / 16.0);
+                        sum += cu * cv * coeffs[u * 8 + v] * cosY * cosX;
+                    }
+                }
+                double expected = 0.25 * sum;
+                Assert.True(Math.Abs(expected - actual[y * 8 + x]) < 1e-2,
+                    $"IDCT mismatch at ({y},{x}): expected={expected}, actual={actual[y * 8 + x]}");
+            }
+        }
+    }
+
+    [Fact]
     public void JpegColorTransform_StandardColors()
     {
         // White: Y=255, Cb=128, Cr=128
