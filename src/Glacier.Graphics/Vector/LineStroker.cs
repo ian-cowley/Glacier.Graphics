@@ -5,10 +5,22 @@ using System.Collections.Generic;
 
 /// <summary>
 /// Analytical line stroker supporting Miter, Round, and Bevel joins,
-/// Butt, Square, and Round caps, and non-allocating dashing.
+/// Butt, Square, and Round caps, and pooled-scratch dashing.
 /// </summary>
 public static class LineStroker
 {
+    private sealed class ScratchBuffers
+    {
+        public readonly List<PointF> LeftOrOuter = new(64);
+        public readonly List<PointF> RightOrInner = new(64);
+        public readonly List<PointF> DashSegment = new(64);
+    }
+
+    [ThreadStatic]
+    private static ScratchBuffers? t_scratch;
+
+    private static ScratchBuffers GetScratch() => t_scratch ??= new ScratchBuffers();
+
     public static VectorPath Stroke(
         VectorPath path,
         float strokeWidth,
@@ -24,6 +36,7 @@ public static class LineStroker
 
         float halfWidth = strokeWidth * 0.5f;
         var contours = path.Flatten(0.25f);
+        var scratch = GetScratch();
 
         foreach (var contour in contours)
         {
@@ -33,24 +46,17 @@ public static class LineStroker
 
             if (dashPattern.Length > 0)
             {
-                var dashedSegments = ApplyDashing(contour, dashPattern, dashPhase, isClosed);
-                foreach (var segment in dashedSegments)
-                {
-                    if (segment.Count >= 2)
-                    {
-                        StrokeOpenContour(result, segment, halfWidth, cap, join, miterLimit);
-                    }
-                }
+                StrokeDashedContour(result, contour, dashPattern, dashPhase, halfWidth, cap, join, miterLimit, scratch);
             }
             else
             {
                 if (isClosed)
                 {
-                    StrokeClosedContour(result, contour, halfWidth, join, miterLimit);
+                    StrokeClosedContour(result, contour, halfWidth, join, miterLimit, scratch);
                 }
                 else
                 {
-                    StrokeOpenContour(result, contour, halfWidth, cap, join, miterLimit);
+                    StrokeOpenContour(result, contour, halfWidth, cap, join, miterLimit, scratch);
                 }
             }
         }
@@ -64,16 +70,17 @@ public static class LineStroker
         float halfWidth,
         StrokeCap cap,
         StrokeJoin join,
-        float miterLimit)
+        float miterLimit,
+        ScratchBuffers scratch)
     {
         int n = pts.Count;
         if (n < 2) return;
 
-        // Left offset polyline and Right offset polyline
-        var left = new List<PointF>();
-        var right = new List<PointF>();
+        var left = scratch.LeftOrOuter;
+        var right = scratch.RightOrInner;
+        left.Clear();
+        right.Clear();
 
-        // First segment normal
         PointF d0 = (pts[1] - pts[0]).Normalize();
         PointF n0 = new PointF(-d0.Y, d0.X);
 
@@ -94,21 +101,18 @@ public static class LineStroker
             AddJoin(left, right, pCurr, n1, n2, d1, d2, halfWidth, join, miterLimit);
         }
 
-        // Last segment normal
         PointF dLast = (pts[n - 1] - pts[n - 2]).Normalize();
         PointF nLast = new PointF(-dLast.Y, dLast.X);
 
         left.Add(pts[n - 1] + nLast * halfWidth);
         right.Add(pts[n - 1] - nLast * halfWidth);
 
-        // Build closed path: left side forward, end cap, right side backwards, start cap
         outPath.MoveTo(left[0]);
         for (int i = 1; i < left.Count; i++)
         {
             outPath.LineTo(left[i]);
         }
 
-        // End cap: from left[^1] to right[^1]
         AddCap(outPath, pts[n - 1], left[^1], right[^1], dLast, halfWidth, cap);
 
         for (int i = right.Count - 1; i >= 0; i--)
@@ -116,7 +120,6 @@ public static class LineStroker
             outPath.LineTo(right[i]);
         }
 
-        // Start cap: from right[0] to left[0]
         AddCap(outPath, pts[0], right[0], left[0], PointF.Zero - d0, halfWidth, cap);
 
         outPath.Close();
@@ -127,13 +130,16 @@ public static class LineStroker
         List<PointF> pts,
         float halfWidth,
         StrokeJoin join,
-        float miterLimit)
+        float miterLimit,
+        ScratchBuffers scratch)
     {
         int n = pts.Count - 1; // last point equals first
         if (n < 3) return;
 
-        var outer = new List<PointF>();
-        var inner = new List<PointF>();
+        var outer = scratch.LeftOrOuter;
+        var inner = scratch.RightOrInner;
+        outer.Clear();
+        inner.Clear();
 
         for (int i = 0; i < n; i++)
         {
@@ -159,8 +165,6 @@ public static class LineStroker
         if (inner.Count > 0)
         {
             // Emit inner contour in reverse so its winding opposes the outer contour.
-            // With NonZero winding rule this produces a hollow annular stroke instead
-            // of a solid filled region.
             outPath.MoveTo(inner[inner.Count - 1]);
             for (int i = inner.Count - 2; i >= 0; i--) outPath.LineTo(inner[i]);
             outPath.Close();
@@ -215,7 +219,6 @@ public static class LineStroker
                     return;
                 }
             }
-            // Miter limit exceeded -> fallback to Bevel
             join = StrokeJoin.Bevel;
         }
 
@@ -226,7 +229,6 @@ public static class LineStroker
                 right.Add(p - n1 * halfWidth);
                 right.Add(p - n2 * halfWidth);
 
-                // Round fan on left
                 int steps = Math.Clamp((int)(halfWidth * 0.5f) + 4, 4, 16);
                 for (int s = 0; s <= steps; s++)
                 {
@@ -251,20 +253,10 @@ public static class LineStroker
         }
         else // Bevel
         {
-            if (turnsLeft)
-            {
-                left.Add(p + n1 * halfWidth);
-                left.Add(p + n2 * halfWidth);
-                right.Add(p - n1 * halfWidth);
-                right.Add(p - n2 * halfWidth);
-            }
-            else
-            {
-                left.Add(p + n1 * halfWidth);
-                left.Add(p + n2 * halfWidth);
-                right.Add(p - n1 * halfWidth);
-                right.Add(p - n2 * halfWidth);
-            }
+            left.Add(p + n1 * halfWidth);
+            left.Add(p + n2 * halfWidth);
+            right.Add(p - n1 * halfWidth);
+            right.Add(p - n2 * halfWidth);
         }
     }
 
@@ -306,26 +298,28 @@ public static class LineStroker
         }
     }
 
-    private static List<List<PointF>> ApplyDashing(
+    private static void StrokeDashedContour(
+        VectorPath outPath,
         List<PointF> contour,
         ReadOnlySpan<float> dashPattern,
         float dashPhase,
-        bool isClosed)
+        float halfWidth,
+        StrokeCap cap,
+        StrokeJoin join,
+        float miterLimit,
+        ScratchBuffers scratch)
     {
-        var result = new List<List<PointF>>();
-        if (contour.Count < 2 || dashPattern.Length == 0) return result;
+        if (contour.Count < 2 || dashPattern.Length == 0) return;
 
-        // Calculate total pattern length
         float patternLen = 0f;
         for (int i = 0; i < dashPattern.Length; i++)
             patternLen += dashPattern[i];
 
-        if (patternLen <= 0f) return result;
+        if (patternLen <= 0f) return;
 
         float phase = dashPhase % patternLen;
         if (phase < 0f) phase += patternLen;
 
-        // Find initial dash index and offset into current dash
         int dashIdx = 0;
         float dashRem = 0f;
         float accum = 0f;
@@ -340,12 +334,13 @@ public static class LineStroker
             accum += dashPattern[i];
         }
 
+        var currentDash = scratch.DashSegment;
+        currentDash.Clear();
+
         bool isDraw = (dashIdx % 2 == 0);
-        List<PointF>? currentDash = isDraw ? new List<PointF>() : null;
-        if (currentDash != null)
+        if (isDraw)
         {
             currentDash.Add(contour[0]);
-            result.Add(currentDash);
         }
 
         PointF prev = contour[0];
@@ -367,7 +362,7 @@ public static class LineStroker
                 {
                     segDist = segLen;
                     dashRem -= available;
-                    if (isDraw && currentDash != null)
+                    if (isDraw)
                     {
                         currentDash.Add(curr);
                     }
@@ -377,24 +372,23 @@ public static class LineStroker
                     segDist += needed;
                     PointF splitPt = prev + dir * segDist;
 
-                    if (isDraw && currentDash != null)
+                    if (isDraw)
                     {
                         currentDash.Add(splitPt);
+                        if (currentDash.Count >= 2)
+                        {
+                            StrokeOpenContour(outPath, currentDash, halfWidth, cap, join, miterLimit, scratch);
+                        }
+                        currentDash.Clear();
                     }
 
-                    // Advance dash pattern
                     dashIdx = (dashIdx + 1) % dashPattern.Length;
                     dashRem = dashPattern[dashIdx];
                     isDraw = (dashIdx % 2 == 0);
 
                     if (isDraw)
                     {
-                        currentDash = new List<PointF> { splitPt };
-                        result.Add(currentDash);
-                    }
-                    else
-                    {
-                        currentDash = null;
+                        currentDash.Add(splitPt);
                     }
                 }
             }
@@ -402,6 +396,10 @@ public static class LineStroker
             prev = curr;
         }
 
-        return result;
+        if (isDraw && currentDash.Count >= 2)
+        {
+            StrokeOpenContour(outPath, currentDash, halfWidth, cap, join, miterLimit, scratch);
+        }
+        currentDash.Clear();
     }
 }

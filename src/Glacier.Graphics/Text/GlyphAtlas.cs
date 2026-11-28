@@ -1,6 +1,7 @@
 namespace Glacier.Graphics.Text;
 
 using System;
+using System.Buffers;
 using System.Collections.Generic;
 using Glacier.Graphics.Vector;
 
@@ -24,11 +25,32 @@ public sealed class AtlasGlyph
 }
 
 /// <summary>
-/// Dynamic texture atlas using shelf-packing allocation and LRU caching
-/// for rasterized font glyphs.
+/// Dynamic R8 grayscale shelf-packing texture atlas maintaining a value-keyed LRU cache
+/// of rasterized font glyphs with warm-glyph compaction on capacity eviction.
 /// </summary>
 public sealed class GlyphAtlas
 {
+    private readonly record struct GlyphCacheKey(
+        TrueTypeFont? Typeface,
+        string FamilyName,
+        float Size,
+        bool Bold,
+        bool Italic,
+        int GlyphIndex,
+        int SubpixelBin);
+
+    private sealed class CacheEntry
+    {
+        public AtlasGlyph Glyph;
+        public readonly LinkedListNode<GlyphCacheKey> LruNode;
+
+        public CacheEntry(AtlasGlyph glyph, LinkedListNode<GlyphCacheKey> lruNode)
+        {
+            Glyph = glyph;
+            LruNode = lruNode;
+        }
+    }
+
     private readonly int _width;
     private readonly int _height;
     private readonly byte[] _pixels; // R8 coverage buffer
@@ -37,17 +59,21 @@ public sealed class GlyphAtlas
     private int _currentY;
     private int _shelfHeight;
 
-    private readonly Dictionary<(Font Font, int GlyphIndex, int SubpixelBin), AtlasGlyph> _cache = new();
+    private readonly Dictionary<GlyphCacheKey, CacheEntry> _cache = new();
+    private readonly LinkedList<GlyphCacheKey> _lruOrder = new();
 
     public int Width => _width;
     public int Height => _height;
+    public int CachedGlyphCount => _cache.Count;
     public ReadOnlySpan<byte> Pixels => _pixels;
 
     public GlyphAtlas(int width = 2048, int height = 2048)
     {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(width);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(height);
         _width = width;
         _height = height;
-        _pixels = new byte[width * height];
+        _pixels = new byte[checked(width * height)];
         _currentX = 0;
         _currentY = 0;
         _shelfHeight = 0;
@@ -57,6 +83,7 @@ public sealed class GlyphAtlas
     {
         Array.Clear(_pixels);
         _cache.Clear();
+        _lruOrder.Clear();
         _currentX = 0;
         _currentY = 0;
         _shelfHeight = 0;
@@ -64,16 +91,19 @@ public sealed class GlyphAtlas
 
     public AtlasGlyph GetOrAdd(Font font, int glyphIndex, float fractionalX = 0f)
     {
+        ArgumentNullException.ThrowIfNull(font);
         int subpixelBin = Math.Clamp((int)MathF.Round(fractionalX * 4f), 0, 3);
-        var key = (font, glyphIndex, subpixelBin);
+        var typeface = font.EffectiveTypeface;
+        var key = new GlyphCacheKey(typeface, font.FamilyName, font.Size, font.Bold, font.Italic, glyphIndex, subpixelBin);
 
-        if (_cache.TryGetValue(key, out var cached))
+        if (_cache.TryGetValue(key, out var entry))
         {
-            return cached;
+            _lruOrder.Remove(entry.LruNode);
+            _lruOrder.AddFirst(entry.LruNode);
+            return entry.Glyph;
         }
 
         // Render glyph
-        var typeface = font.EffectiveTypeface;
         float scale = typeface != null ? font.Size / typeface.UnitsPerEm : font.Size / 1000f;
         VectorPath glyphPath = typeface?.GetGlyphPath(glyphIndex) ?? new VectorPath();
         ushort adv = typeface?.GetAdvanceWidth(glyphIndex) ?? (ushort)1000;
@@ -85,24 +115,31 @@ public sealed class GlyphAtlas
 
         LcdGlyphBitmap bitmap = LcdGlyphRasterizer.Rasterize(glyphPath, scale, subpixelBin * 0.25f);
 
-        // Pack into shelf
         int bmpWidth = bitmap.Width;
         int bmpHeight = bitmap.Height;
 
         if (bmpWidth <= 0 || bmpHeight <= 0)
         {
             var emptyGlyph = new AtlasGlyph(RectF.Empty, 0f, 0f, advance);
-            _cache[key] = emptyGlyph;
+            var node = _lruOrder.AddFirst(key);
+            _cache[key] = new CacheEntry(emptyGlyph, node);
             return emptyGlyph;
         }
 
-        // Shelf packing logic (add 1 pixel padding)
+        // Shelf packing logic (add 1 pixel padding on all sides)
         int padWidth = bmpWidth + 2;
         int padHeight = bmpHeight + 2;
 
+        if (padWidth > _width || padHeight > _height)
+        {
+            var oversizedEmpty = new AtlasGlyph(RectF.Empty, bitmap.BearingX, bitmap.BearingY, advance);
+            var node = _lruOrder.AddFirst(key);
+            _cache[key] = new CacheEntry(oversizedEmpty, node);
+            return oversizedEmpty;
+        }
+
         if (_currentX + padWidth > _width)
         {
-            // Move to next shelf
             _currentX = 0;
             _currentY += _shelfHeight;
             _shelfHeight = 0;
@@ -110,17 +147,13 @@ public sealed class GlyphAtlas
 
         if (_currentY + padHeight > _height)
         {
-            // Atlas is full -> evict and reset
-            Clear();
-            _currentX = 0;
-            _currentY = 0;
-            _shelfHeight = 0;
+            EvictColdAndRepackWarm(requiredWidth: padWidth, requiredHeight: padHeight);
         }
 
         int targetX = _currentX + 1;
         int targetY = _currentY + 1;
 
-        // Blit glyph R8 coverage (using green channel of LCD bitmap or average)
+        // Blit glyph R8 coverage (green channel represents central luminance in LCD RGB subpixels)
         for (int y = 0; y < bmpHeight; y++)
         {
             int srcRow = y * bitmap.Stride;
@@ -128,7 +161,6 @@ public sealed class GlyphAtlas
 
             for (int x = 0; x < bmpWidth; x++)
             {
-                // Green channel represents central luminance in LCD RGB subpixels
                 _pixels[dstRow + x] = bitmap.Data[srcRow + x * 3 + 1];
             }
         }
@@ -142,7 +174,110 @@ public sealed class GlyphAtlas
             bitmap.BearingY,
             advance);
 
-        _cache[key] = glyph;
+        var lruNode = _lruOrder.AddFirst(key);
+        _cache[key] = new CacheEntry(glyph, lruNode);
         return glyph;
+    }
+
+    private void EvictColdAndRepackWarm(int requiredWidth, int requiredHeight)
+    {
+        byte[] tempPixels = ArrayPool<byte>.Shared.Rent(_pixels.Length);
+        try
+        {
+            Array.Clear(tempPixels, 0, _pixels.Length);
+
+            int newX = 0;
+            int newY = 0;
+            int newShelfH = 0;
+            int maxWarmHeight = Math.Max(0, _height - requiredHeight);
+            // Reserve at least 35% of atlas height (plus space for the incoming glyph) so thrashing does not immediately recur
+            int warmBudgetY = Math.Min(maxWarmHeight, (int)(_height * 0.65f));
+
+            var node = _lruOrder.First;
+            bool keeping = true;
+
+            while (node != null)
+            {
+                var next = node.Next;
+                var entry = _cache[node.Value];
+                RectF r = entry.Glyph.Rect;
+                int gw = (int)r.Width;
+                int gh = (int)r.Height;
+
+                if (gw <= 0 || gh <= 0)
+                {
+                    // Empty glyphs occupy zero atlas pixels; keep warm ones or evict with cold tail
+                    if (!keeping)
+                    {
+                        _cache.Remove(node.Value);
+                        _lruOrder.Remove(node);
+                    }
+                    node = next;
+                    continue;
+                }
+
+                if (keeping)
+                {
+                    int padW = gw + 2;
+                    int padH = gh + 2;
+                    int tryX = newX;
+                    int tryY = newY;
+                    int tryShelfH = newShelfH;
+
+                    if (tryX + padW > _width)
+                    {
+                        tryX = 0;
+                        tryY += tryShelfH;
+                        tryShelfH = 0;
+                    }
+
+                    bool fitsWarmBudget = tryY + padH <= warmBudgetY;
+                    bool leavesRoomForIncoming = (tryX + padW + requiredWidth <= _width && tryY + Math.Max(tryShelfH, padH) <= _height)
+                        || (tryY + Math.Max(tryShelfH, padH) + requiredHeight <= _height);
+
+                    if (fitsWarmBudget && leavesRoomForIncoming)
+                    {
+                        int dstX = tryX + 1;
+                        int dstY = tryY + 1;
+                        int oldX = (int)r.X;
+                        int oldY = (int)r.Y;
+
+                        for (int row = 0; row < gh; row++)
+                        {
+                            Buffer.BlockCopy(_pixels, (oldY + row) * _width + oldX, tempPixels, (dstY + row) * _width + dstX, gw);
+                        }
+
+                        entry.Glyph = new AtlasGlyph(new RectF(dstX, dstY, gw, gh), entry.Glyph.BearingX, entry.Glyph.BearingY, entry.Glyph.Advance);
+                        newX = tryX + padW;
+                        newY = tryY;
+                        newShelfH = Math.Max(tryShelfH, padH);
+                        node = next;
+                        continue;
+                    }
+
+                    keeping = false;
+                }
+
+                _cache.Remove(node.Value);
+                _lruOrder.Remove(node);
+                node = next;
+            }
+
+            tempPixels.AsSpan(0, _pixels.Length).CopyTo(_pixels);
+            _currentX = newX;
+            _currentY = newY;
+            _shelfHeight = newShelfH;
+
+            if (_currentX + requiredWidth > _width)
+            {
+                _currentX = 0;
+                _currentY += _shelfHeight;
+                _shelfHeight = 0;
+            }
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(tempPixels);
+        }
     }
 }

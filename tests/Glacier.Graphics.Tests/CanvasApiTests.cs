@@ -59,14 +59,33 @@ public sealed class CanvasApiTests
     public void Canvas_SaveRestore_RestoresClipState()
     {
         using var canvas = new CpuGraphicsCanvas(100, 100);
+        canvas.Clear(Rgba32.White);
         canvas.Save();
 
         var clipPath = new VectorPath();
         clipPath.AddRect(10, 10, 20, 20);
         canvas.ClipPath(clipPath);
 
+        var largeRect = new VectorPath();
+        largeRect.AddRect(0, 0, 80, 80);
+        canvas.FillPath(largeRect, new Paint(Rgba32.Red));
+
+        Rgba32 insideClip = canvas.Framebuffer.GetPixel(20, 20);
+        Assert.True(insideClip.R > 200 && insideClip.G < 50 && insideClip.B < 50);
+
+        // Drawing outside clip rect must be suppressed while clipped
+        Rgba32 outsideClip = canvas.Framebuffer.GetPixel(50, 50);
+        Assert.Equal(Rgba32.White, outsideClip);
+
         canvas.Restore();
-        // State restored
+
+        // Drawing outside the previous clip rect must succeed after Restore()
+        var afterRestoreRect = new VectorPath();
+        afterRestoreRect.AddRect(40, 40, 20, 20);
+        canvas.FillPath(afterRestoreRect, new Paint(Rgba32.Blue));
+
+        Rgba32 restoredPixel = canvas.Framebuffer.GetPixel(50, 50);
+        Assert.True(restoredPixel.B > 200 && restoredPixel.R < 50 && restoredPixel.G < 50);
     }
 
     [Fact]

@@ -2,6 +2,7 @@ namespace Glacier.Graphics.Codecs.Jpeg;
 
 using System;
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
 
 /// <summary>
@@ -29,6 +30,7 @@ public static class JpegColorTransform
     /// <summary>
     /// Vectorized conversion of 64 spatial samples (8x8 block) from Y, Cb, Cr planes to RGBA32.
     /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     public static void ConvertBlock(
         ReadOnlySpan<float> yBlock,
         ReadOnlySpan<float> cbBlock,
@@ -48,8 +50,11 @@ public static class JpegColorTransform
             var vB_Cb = Vector256.Create(1.772f);
             var vZero = Vector256<float>.Zero;
             var v255 = Vector256.Create(255.0f);
+            var vAlpha = Vector256.Create(0xFF000000u);
 
+            Span<uint> dstUint = MemoryMarshal.Cast<Rgba32, uint>(outputBlock);
             int step = Vector256<float>.Count; // 8 floats
+
             for (; i <= 64 - step; i += step)
             {
                 var vy = Vector256.Create(yBlock.Slice(i, step));
@@ -60,14 +65,12 @@ public static class JpegColorTransform
                 var vg = Vector256.Min(v255, Vector256.Max(vZero, vy + vcb * vG_Cb + vcr * vG_Cr));
                 var vb = Vector256.Min(v255, Vector256.Max(vZero, vy + vcb * vB_Cb));
 
-                for (int lane = 0; lane < step; lane++)
-                {
-                    outputBlock[i + lane] = new Rgba32(
-                        (byte)MathF.Round(vr[lane]),
-                        (byte)MathF.Round(vg[lane]),
-                        (byte)MathF.Round(vb[lane]),
-                        255);
-                }
+                var ir = Vector256.ConvertToInt32(vr).AsUInt32();
+                var ig = Vector256.ConvertToInt32(vg).AsUInt32();
+                var ib = Vector256.ConvertToInt32(vb).AsUInt32();
+
+                var packed = ir | (ig << 8) | (ib << 16) | vAlpha;
+                packed.CopyTo(dstUint.Slice(i, step));
             }
         }
 

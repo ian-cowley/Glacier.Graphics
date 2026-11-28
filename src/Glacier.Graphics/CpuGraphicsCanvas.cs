@@ -61,15 +61,17 @@ public sealed class CpuGraphicsCanvas : IGraphicsCanvas
     public void DrawPath(in VectorPath path, in Paint paint)
     {
         if (path == null || path.VerbCount == 0 || paint.Color.A == 0) return;
+        if (!(_currentState.Clip.Width > 0f && _currentState.Clip.Height > 0f)) return;
 
-        var transformed = new VectorPath(path);
+        VectorPath effectivePath = path;
         if (_currentState.Transform != Matrix3x2.Identity)
         {
-            transformed.Transform(_currentState.Transform);
+            effectivePath = new VectorPath(path);
+            effectivePath.Transform(_currentState.Transform);
         }
 
         VectorPath stroked = LineStroker.Stroke(
-            transformed,
+            effectivePath,
             paint.StrokeWidth,
             paint.Cap,
             paint.Join,
@@ -77,25 +79,28 @@ public sealed class CpuGraphicsCanvas : IGraphicsCanvas
 
         // Use EvenOdd winding so self-intersecting stroke polygons (e.g. fast-oscillating
         // signal lines) render as thin strokes rather than solid filled regions.
-        _rasterizer.FillPath(_framebuffer, stroked, paint.Color, WindingRule.EvenOdd, _currentState.Clip);
+        _rasterizer.FillPath(_framebuffer, stroked, paint.Color, WindingRule.EvenOdd, (RectF?)_currentState.Clip);
     }
 
     public void FillPath(in VectorPath path, in Paint paint)
     {
         if (path == null || path.VerbCount == 0 || paint.Color.A == 0) return;
+        if (!(_currentState.Clip.Width > 0f && _currentState.Clip.Height > 0f)) return;
 
-        var transformed = new VectorPath(path);
+        VectorPath effectivePath = path;
         if (_currentState.Transform != Matrix3x2.Identity)
         {
-            transformed.Transform(_currentState.Transform);
+            effectivePath = new VectorPath(path);
+            effectivePath.Transform(_currentState.Transform);
         }
 
-        _rasterizer.FillPath(_framebuffer, transformed, paint.Color, transformed.FillRule, _currentState.Clip);
+        _rasterizer.FillPath(_framebuffer, effectivePath, paint.Color, effectivePath.FillRule, (RectF?)_currentState.Clip);
     }
 
     public void DrawText(ReadOnlySpan<char> text, float x, float y, in Font font, in Paint paint)
     {
         if (text.IsEmpty || paint.Color.A == 0) return;
+        if (!(_currentState.Clip.Width > 0f && _currentState.Clip.Height > 0f)) return;
 
         float curX = x;
         for (int i = 0; i < text.Length; i++)
@@ -139,8 +144,7 @@ public sealed class CpuGraphicsCanvas : IGraphicsCanvas
                         byte coverage = atlasPixels[atlasRow + gx];
                         if (coverage > 0)
                         {
-                            float alpha = (coverage / 255.0f) * (paint.Color.A / 255.0f);
-                            BlendPixel(ref row[px], paint.Color, alpha);
+                            ColorBlend.BlendPixel(ref row[px], paint.Color, coverage / 255.0f);
                         }
                     }
                 }
@@ -153,6 +157,7 @@ public sealed class CpuGraphicsCanvas : IGraphicsCanvas
     public void DrawImage(in ReadOnlySpan2D<Rgba32> image, float x, float y, float width, float height)
     {
         if (image.Width <= 0 || image.Height <= 0 || width <= 0f || height <= 0f) return;
+        if (!(_currentState.Clip.Width > 0f && _currentState.Clip.Height > 0f)) return;
 
         int dstMinX = Math.Max(0, Math.Max((int)MathF.Floor(x), (int)MathF.Floor(_currentState.Clip.Left)));
         int dstMaxX = Math.Min(_framebuffer.Width, Math.Min((int)MathF.Ceiling(x + width), (int)MathF.Ceiling(_currentState.Clip.Right)));
@@ -181,7 +186,7 @@ public sealed class CpuGraphicsCanvas : IGraphicsCanvas
                 }
                 else if (srcColor.A > 0)
                 {
-                    BlendPixel(ref row[px], srcColor, srcColor.A / 255.0f);
+                    ColorBlend.BlendPixel(ref row[px], srcColor, 1.0f);
                 }
             }
         }
@@ -219,20 +224,5 @@ public sealed class CpuGraphicsCanvas : IGraphicsCanvas
             }
             _disposed = true;
         }
-    }
-
-    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
-    private static void BlendPixel(ref Rgba32 dst, Rgba32 src, float coverage)
-    {
-        float srcA = (src.A / 255.0f) * coverage;
-        if (srcA <= 0f) return;
-
-        float invA = 1.0f - srcA;
-        byte outR = (byte)Math.Clamp((int)MathF.Round(src.R * srcA + dst.R * invA), 0, 255);
-        byte outG = (byte)Math.Clamp((int)MathF.Round(src.G * srcA + dst.G * invA), 0, 255);
-        byte outB = (byte)Math.Clamp((int)MathF.Round(src.B * srcA + dst.B * invA), 0, 255);
-        byte outA = (byte)Math.Clamp((int)MathF.Round(src.A * srcA + dst.A * invA), 0, 255);
-
-        dst = new Rgba32(outR, outG, outB, outA);
     }
 }

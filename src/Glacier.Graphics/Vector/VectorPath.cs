@@ -261,14 +261,11 @@ public sealed class VectorPath
         return contours;
     }
 
-    private const int MaxFlattenDepth = 16;
-
-    private static void FlattenQuad(List<PointF> output, PointF p0, PointF p1, PointF p2, float tolerance, int depth = 0)
+    private static void FlattenQuad(List<PointF> output, PointF p0, PointF p1, PointF p2, float tolerance)
     {
         if (!float.IsFinite(p0.X) || !float.IsFinite(p0.Y) ||
             !float.IsFinite(p1.X) || !float.IsFinite(p1.Y) ||
-            !float.IsFinite(p2.X) || !float.IsFinite(p2.Y) ||
-            depth >= MaxFlattenDepth)
+            !float.IsFinite(p2.X) || !float.IsFinite(p2.Y))
         {
             if (float.IsFinite(p2.X) && float.IsFinite(p2.Y))
             {
@@ -277,31 +274,44 @@ public sealed class VectorPath
             return;
         }
 
-        // De Casteljau subdivision based on flatness
-        float dx = p2.X - p0.X;
-        float dy = p2.Y - p0.Y;
-        float d = MathF.Abs((p1.X - p2.X) * dy - (p1.Y - p2.Y) * dx);
-        if (d * d <= tolerance * tolerance * (dx * dx + dy * dy) || d <= 1e-4f)
+        float tol = MathF.Max(tolerance, 1e-3f);
+        float ddx = p0.X - 2f * p1.X + p2.X;
+        float ddy = p0.Y - 2f * p1.Y + p2.Y;
+        float dist = MathF.Sqrt(ddx * ddx + ddy * ddy);
+        int n = Math.Clamp((int)MathF.Ceiling(MathF.Sqrt(dist / (8f * tol))), 1, 256);
+
+        if (n <= 1)
         {
             output.Add(p2);
             return;
         }
 
-        PointF p01 = (p0 + p1) * 0.5f;
-        PointF p12 = (p1 + p2) * 0.5f;
-        PointF p012 = (p01 + p12) * 0.5f;
+        Span<float> tValues = stackalloc float[n];
+        Span<float> outX = stackalloc float[n];
+        Span<float> outY = stackalloc float[n];
+        float invN = 1.0f / n;
+        for (int k = 0; k < n - 1; k++)
+        {
+            tValues[k] = (k + 1) * invN;
+        }
+        tValues[n - 1] = 1.0f;
 
-        FlattenQuad(output, p0, p01, p012, tolerance, depth + 1);
-        FlattenQuad(output, p012, p12, p2, tolerance, depth + 1);
+        BezierKernels.EvaluateQuadratic(p0.X, p0.Y, p1.X, p1.Y, p2.X, p2.Y, tValues, outX, outY);
+
+        output.EnsureCapacity(output.Count + n);
+        for (int k = 0; k < n - 1; k++)
+        {
+            output.Add(new PointF(outX[k], outY[k]));
+        }
+        output.Add(p2);
     }
 
-    private static void FlattenCubic(List<PointF> output, PointF p0, PointF p1, PointF p2, PointF p3, float tolerance, int depth = 0)
+    private static void FlattenCubic(List<PointF> output, PointF p0, PointF p1, PointF p2, PointF p3, float tolerance)
     {
         if (!float.IsFinite(p0.X) || !float.IsFinite(p0.Y) ||
             !float.IsFinite(p1.X) || !float.IsFinite(p1.Y) ||
             !float.IsFinite(p2.X) || !float.IsFinite(p2.Y) ||
-            !float.IsFinite(p3.X) || !float.IsFinite(p3.Y) ||
-            depth >= MaxFlattenDepth)
+            !float.IsFinite(p3.X) || !float.IsFinite(p3.Y))
         {
             if (float.IsFinite(p3.X) && float.IsFinite(p3.Y))
             {
@@ -310,28 +320,38 @@ public sealed class VectorPath
             return;
         }
 
-        // Subdivide if control points deviate from chord line
-        float dx = p3.X - p0.X;
-        float dy = p3.Y - p0.Y;
-        float lenSq = dx * dx + dy * dy;
-        float d1 = MathF.Abs((p1.X - p3.X) * dy - (p1.Y - p3.Y) * dx);
-        float d2 = MathF.Abs((p2.X - p3.X) * dy - (p2.Y - p3.Y) * dx);
+        float tol = MathF.Max(tolerance, 1e-3f);
+        float d1x = p0.X - 2f * p1.X + p2.X;
+        float d1y = p0.Y - 2f * p1.Y + p2.Y;
+        float d2x = p1.X - 2f * p2.X + p3.X;
+        float d2y = p1.Y - 2f * p2.Y + p3.Y;
+        float dist = MathF.Max(MathF.Sqrt(d1x * d1x + d1y * d1y), MathF.Sqrt(d2x * d2x + d2y * d2y));
+        int n = Math.Clamp((int)MathF.Ceiling(MathF.Sqrt(0.75f * dist / tol)), 1, 256);
 
-        if ((d1 + d2) * (d1 + d2) <= 4f * tolerance * tolerance * lenSq || (d1 + d2) <= 1e-4f)
+        if (n <= 1)
         {
             output.Add(p3);
             return;
         }
 
-        PointF p01 = (p0 + p1) * 0.5f;
-        PointF p12 = (p1 + p2) * 0.5f;
-        PointF p23 = (p2 + p3) * 0.5f;
-        PointF p012 = (p01 + p12) * 0.5f;
-        PointF p123 = (p12 + p23) * 0.5f;
-        PointF p0123 = (p012 + p123) * 0.5f;
+        Span<float> tValues = stackalloc float[n];
+        Span<float> outX = stackalloc float[n];
+        Span<float> outY = stackalloc float[n];
+        float invN = 1.0f / n;
+        for (int k = 0; k < n - 1; k++)
+        {
+            tValues[k] = (k + 1) * invN;
+        }
+        tValues[n - 1] = 1.0f;
 
-        FlattenCubic(output, p0, p01, p012, p0123, tolerance, depth + 1);
-        FlattenCubic(output, p0123, p123, p23, p3, tolerance, depth + 1);
+        BezierKernels.EvaluateCubic(p0.X, p0.Y, p1.X, p1.Y, p2.X, p2.Y, p3.X, p3.Y, tValues, outX, outY);
+
+        output.EnsureCapacity(output.Count + n);
+        for (int k = 0; k < n - 1; k++)
+        {
+            output.Add(new PointF(outX[k], outY[k]));
+        }
+        output.Add(p3);
     }
 
     private void EnsureVerbCapacity(int additional)

@@ -9,13 +9,13 @@ public partial class TinyPdfCreate
         private class PageContextImpl : IPageContext
         {
             private readonly Builder _builder;
-            private readonly ArrayBufferWriter<byte> _writer;
+            private readonly IBufferWriter<byte> _writer;
             private readonly List<(string Name, Ref Ref)> _images;
             private int _imageCount;
             private readonly Action<int> _updateImageCount;
             private readonly List<(string Url, double[] Rect)> _links;
 
-            public PageContextImpl(Builder builder, ArrayBufferWriter<byte> writer, List<(string Name, Ref Ref)> images, int imageCount, Action<int> updateImageCount, List<(string Url, double[] Rect)> links)
+            public PageContextImpl(Builder builder, IBufferWriter<byte> writer, List<(string Name, Ref Ref)> images, int imageCount, Action<int> updateImageCount, List<(string Url, double[] Rect)> links)
             {
                 _builder = builder;
                 _writer = writer;

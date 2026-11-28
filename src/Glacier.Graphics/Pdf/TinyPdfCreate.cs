@@ -79,30 +79,13 @@ public partial class TinyPdfCreate
     }
 
     private static void BufferWriteAscii(IBufferWriter<byte> w, string s)
-    {
-        var span = w.GetSpan(s.Length);
-        for (int i = 0; i < s.Length; i++) span[i] = (byte)s[i];
-        w.Advance(s.Length);
-    }
+        => Pdf17Writer.WriteAscii(w, s);
 
     private static void BufferWriteUtf8(IBufferWriter<byte> w, ReadOnlySpan<char> chars)
-    {
-        int byteCount = Encoding.UTF8.GetByteCount(chars);
-        var span = w.GetSpan(byteCount);
-        int written = Encoding.UTF8.GetBytes(chars, span);
-        w.Advance(written);
-    }
+        => Pdf17Writer.WriteUtf8(w, chars);
 
     private static void BufferWriteDouble(IBufferWriter<byte> w, double val, byte precision)
-    {
-        var span = w.GetSpan(32);
-        if (System.Buffers.Text.Utf8Formatter.TryFormat(val, span, out int bytesWritten, new System.Buffers.StandardFormat('F', precision)))
-        {
-            w.Advance(bytesWritten);
-            return;
-        }
-        BufferWriteUtf8(w, val.ToString(CultureInfo.InvariantCulture));
-    }
+        => Pdf17Writer.WriteDoubleFixed(w, val, precision);
 
     private static void WriteWinAnsiEscaped(IBufferWriter<byte> w, ReadOnlySpan<char> s)
     {
@@ -162,14 +145,6 @@ public partial class TinyPdfCreate
         if (!prefix.IsEmpty) WriteWinAnsiEscaped(w, prefix);
         if (!content.IsEmpty) WriteWinAnsiEscaped(w, content);
         BufferWriteAscii(w, ")");
-    }
-
-    private static void SerializeTo(Stream stream, object? val)
-    {
-        var writer = new ArrayBufferWriter<byte>(256);
-        SerializeToWriter(writer, val);
-        var span = writer.WrittenSpan;
-        stream.Write(span);
     }
 
     private static void SerializeToWriter(IBufferWriter<byte> writer, object? val)

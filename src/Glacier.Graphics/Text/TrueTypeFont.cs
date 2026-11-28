@@ -3,11 +3,12 @@ namespace Glacier.Graphics.Text;
 using System;
 using System.Buffers.Binary;
 using System.Collections.Generic;
+using System.IO;
 using System.Runtime.CompilerServices;
 using Glacier.Graphics.Vector;
 
 /// <summary>
-/// Parsed TrueType / OpenType font file.
+/// Parsed TrueType font file (glyf/loca outlines).
 /// Provides zero-copy table navigation, cmap 4 &amp; 12 Unicode mapping, typography metrics,
 /// and TrueType quadratic outline extraction directly into VectorPath.
 /// </summary>
@@ -56,6 +57,9 @@ public sealed class TrueTypeFont
             string tag = System.Text.Encoding.ASCII.GetString(_fontData, offset, 4);
             int tableOffset = BinaryPrimitives.ReadInt32BigEndian(_fontData.AsSpan(offset + 8, 4));
             int tableLength = BinaryPrimitives.ReadInt32BigEndian(_fontData.AsSpan(offset + 12, 4));
+            if (tableOffset < 0 || tableLength < 0 || (long)tableOffset + tableLength > _fontData.Length)
+                throw new InvalidDataException($"Invalid SFNT table '{tag}' directory entry (offset={tableOffset}, length={tableLength}, fontLength={_fontData.Length}).");
+
             _tables[tag] = (tableOffset, tableLength);
             offset += 16;
         }
@@ -71,7 +75,7 @@ public sealed class TrueTypeFont
 
     private void ParseHeadTable()
     {
-        if (!_tables.TryGetValue("head", out var entry) || entry.Offset + 54 > _fontData.Length)
+        if (!_tables.TryGetValue("head", out var entry) || entry.Offset < 0 || entry.Length < 54 || (long)entry.Offset + 54 > _fontData.Length)
             return;
 
         UnitsPerEm = BinaryPrimitives.ReadUInt16BigEndian(_fontData.AsSpan(entry.Offset + 18, 2));
@@ -81,7 +85,7 @@ public sealed class TrueTypeFont
 
     private void ParseMaxpTable()
     {
-        if (!_tables.TryGetValue("maxp", out var entry) || entry.Offset + 6 > _fontData.Length)
+        if (!_tables.TryGetValue("maxp", out var entry) || entry.Offset < 0 || entry.Length < 6 || (long)entry.Offset + 6 > _fontData.Length)
             return;
 
         NumGlyphs = BinaryPrimitives.ReadUInt16BigEndian(_fontData.AsSpan(entry.Offset + 4, 2));
@@ -89,7 +93,7 @@ public sealed class TrueTypeFont
 
     private void ParseHheaTable()
     {
-        if (!_tables.TryGetValue("hhea", out var entry) || entry.Offset + 36 > _fontData.Length)
+        if (!_tables.TryGetValue("hhea", out var entry) || entry.Offset < 0 || entry.Length < 36 || (long)entry.Offset + 36 > _fontData.Length)
             return;
 
         Ascender = BinaryPrimitives.ReadInt16BigEndian(_fontData.AsSpan(entry.Offset + 4, 2));
@@ -100,7 +104,7 @@ public sealed class TrueTypeFont
 
     private void ParseCmapTable()
     {
-        if (!_tables.TryGetValue("cmap", out var entry) || entry.Offset + 4 > _fontData.Length)
+        if (!_tables.TryGetValue("cmap", out var entry) || entry.Offset < 0 || entry.Length < 4 || (long)entry.Offset + 4 > _fontData.Length)
             return;
 
         int cmapStart = entry.Offset;
@@ -111,14 +115,17 @@ public sealed class TrueTypeFont
 
         for (int i = 0; i < numSubtables; i++)
         {
-            int recOffset = cmapStart + 4 + (i * 8);
-            if (recOffset + 8 > _fontData.Length) break;
+            long recOffsetLong = (long)cmapStart + 4 + ((long)i * 8);
+            if (recOffsetLong + 8 > _fontData.Length) break;
+            int recOffset = (int)recOffsetLong;
 
             ushort platformId = BinaryPrimitives.ReadUInt16BigEndian(_fontData.AsSpan(recOffset, 2));
             ushort encodingId = BinaryPrimitives.ReadUInt16BigEndian(_fontData.AsSpan(recOffset + 2, 2));
-            int subtableOffset = cmapStart + BinaryPrimitives.ReadInt32BigEndian(_fontData.AsSpan(recOffset + 4, 4));
+            int relSubtableOffset = BinaryPrimitives.ReadInt32BigEndian(_fontData.AsSpan(recOffset + 4, 4));
+            if (relSubtableOffset < 0 || (long)cmapStart + relSubtableOffset + 2 > _fontData.Length)
+                throw new InvalidDataException($"Invalid TrueType cmap subtable offset ({relSubtableOffset}).");
 
-            if (subtableOffset + 2 > _fontData.Length) continue;
+            int subtableOffset = cmapStart + relSubtableOffset;
             ushort format = BinaryPrimitives.ReadUInt16BigEndian(_fontData.AsSpan(subtableOffset, 2));
 
             if (format == 4 && (platformId == 0 || (platformId == 3 && encodingId == 1)))
@@ -219,9 +226,10 @@ public sealed class TrueTypeFont
 
         while (low <= high)
         {
-            int mid = (low + high) / 2;
-            int groupOffset = groupsStart + (mid * 12);
-            if (groupOffset + 12 > _fontData.Length) break;
+            int mid = low + ((high - low) / 2);
+            long groupOffsetLong = (long)groupsStart + ((long)mid * 12);
+            if (groupOffsetLong < 0 || groupOffsetLong + 12 > _fontData.Length) break;
+            int groupOffset = (int)groupOffsetLong;
 
             uint startCharCode = BinaryPrimitives.ReadUInt32BigEndian(_fontData.AsSpan(groupOffset, 4));
             uint endCharCode = BinaryPrimitives.ReadUInt32BigEndian(_fontData.AsSpan(groupOffset + 4, 4));
@@ -237,24 +245,54 @@ public sealed class TrueTypeFont
 
     public ushort GetAdvanceWidth(int glyphIndex)
     {
-        if (!_tables.TryGetValue("hmtx", out var entry) || NumberOfHMetrics == 0)
+        if (!_tables.TryGetValue("hmtx", out var entry) || entry.Offset < 0 || NumberOfHMetrics == 0)
             return UnitsPerEm;
 
+        if (glyphIndex < 0) glyphIndex = 0;
         int hmtxOffset = entry.Offset;
         if (glyphIndex < NumberOfHMetrics)
         {
-            int metricOffset = hmtxOffset + (glyphIndex * 4);
-            if (metricOffset + 2 <= _fontData.Length)
-                return BinaryPrimitives.ReadUInt16BigEndian(_fontData.AsSpan(metricOffset, 2));
+            long metricOffset = (long)hmtxOffset + ((long)glyphIndex * 4);
+            if (metricOffset >= 0 && metricOffset + 2 <= _fontData.Length)
+                return BinaryPrimitives.ReadUInt16BigEndian(_fontData.AsSpan((int)metricOffset, 2));
         }
         else
         {
-            int lastMetricOffset = hmtxOffset + ((NumberOfHMetrics - 1) * 4);
-            if (lastMetricOffset + 2 <= _fontData.Length)
-                return BinaryPrimitives.ReadUInt16BigEndian(_fontData.AsSpan(lastMetricOffset, 2));
+            long lastMetricOffset = (long)hmtxOffset + (((long)NumberOfHMetrics - 1) * 4);
+            if (lastMetricOffset >= 0 && lastMetricOffset + 2 <= _fontData.Length)
+                return BinaryPrimitives.ReadUInt16BigEndian(_fontData.AsSpan((int)lastMetricOffset, 2));
         }
 
         return UnitsPerEm;
+    }
+
+    /// <summary>
+    /// Calculates font advance width normalized to 1000 units per em (PDF point standard).
+    /// </summary>
+    public int GetPdfWidth(int unicodeCodePoint)
+    {
+        int glyphIndex = GetGlyphIndex(unicodeCodePoint);
+        ushort advance = GetAdvanceWidth(glyphIndex);
+        if (UnitsPerEm == 1000) return advance;
+        return (int)Math.Round((double)advance * 1000.0 / UnitsPerEm);
+    }
+
+    /// <summary>
+    /// Measures text width in PDF points for a given font size.
+    /// </summary>
+    public double MeasureText(ReadOnlySpan<char> text, double fontSize)
+    {
+        double totalUnits = 0;
+        for (int i = 0; i < text.Length; i++)
+        {
+            int codePoint = char.IsHighSurrogate(text[i]) && i + 1 < text.Length && char.IsLowSurrogate(text[i + 1])
+                ? char.ConvertToUtf32(text[i++], text[i])
+                : text[i];
+
+            totalUnits += GetPdfWidth(codePoint);
+        }
+
+        return (totalUnits * fontSize) / 1000.0;
     }
 
     /// <summary>
@@ -263,27 +301,30 @@ public sealed class TrueTypeFont
     public int GetGlyphOffset(int glyphIndex, out int length)
     {
         length = 0;
-        if (_locaOffset < 0 || glyphIndex < 0 || glyphIndex >= NumGlyphs) return -1;
+        if (_locaOffset < 0 || _glyfOffset < 0 || glyphIndex < 0 || glyphIndex >= NumGlyphs) return -1;
 
         int offset1, offset2;
         if (IndexToLocFormat == 0)
         {
-            int addr = _locaOffset + (glyphIndex * 2);
-            if (addr + 4 > _fontData.Length) return -1;
-            offset1 = BinaryPrimitives.ReadUInt16BigEndian(_fontData.AsSpan(addr, 2)) * 2;
-            offset2 = BinaryPrimitives.ReadUInt16BigEndian(_fontData.AsSpan(addr + 2, 2)) * 2;
+            long addr = (long)_locaOffset + ((long)glyphIndex * 2);
+            if (addr < 0 || addr + 4 > _fontData.Length) return -1;
+            offset1 = BinaryPrimitives.ReadUInt16BigEndian(_fontData.AsSpan((int)addr, 2)) * 2;
+            offset2 = BinaryPrimitives.ReadUInt16BigEndian(_fontData.AsSpan((int)addr + 2, 2)) * 2;
         }
         else
         {
-            int addr = _locaOffset + (glyphIndex * 4);
-            if (addr + 8 > _fontData.Length) return -1;
-            offset1 = BinaryPrimitives.ReadInt32BigEndian(_fontData.AsSpan(addr, 4));
-            offset2 = BinaryPrimitives.ReadInt32BigEndian(_fontData.AsSpan(addr + 4, 4));
+            long addr = (long)_locaOffset + ((long)glyphIndex * 4);
+            if (addr < 0 || addr + 8 > _fontData.Length) return -1;
+            offset1 = BinaryPrimitives.ReadInt32BigEndian(_fontData.AsSpan((int)addr, 4));
+            offset2 = BinaryPrimitives.ReadInt32BigEndian(_fontData.AsSpan((int)addr + 4, 4));
         }
 
+        if (offset1 < 0 || offset2 < offset1) return -1;
         length = offset2 - offset1;
         if (length <= 0) return -1;
-        return _glyfOffset + offset1;
+        long glyphPos = (long)_glyfOffset + offset1;
+        if (glyphPos < 0 || glyphPos > _fontData.Length) return -1;
+        return (int)glyphPos;
     }
 
     /// <summary>
@@ -302,43 +343,66 @@ public sealed class TrueTypeFont
         if (depth > 10) return; // Prevent infinite recursion on circular composites
 
         int glyphOffset = GetGlyphOffset(glyphIndex, out int glyphLength);
-        if (glyphOffset < 0 || glyphOffset + 10 > _fontData.Length) return;
+        if (glyphOffset < 0 || glyphLength < 10 || (long)glyphOffset + glyphLength > _fontData.Length) return;
 
         short numberOfContours = BinaryPrimitives.ReadInt16BigEndian(_fontData.AsSpan(glyphOffset, 2));
 
         if (numberOfContours > 0)
         {
-            ParseSimpleGlyph(glyphOffset, numberOfContours, path, transform);
+            ParseSimpleGlyph(glyphOffset, glyphLength, numberOfContours, path, transform);
         }
         else if (numberOfContours < 0)
         {
-            ParseCompositeGlyph(glyphOffset, path, transform, depth);
+            ParseCompositeGlyph(glyphOffset, glyphLength, path, transform, depth);
         }
     }
 
-    private void ParseSimpleGlyph(int offset, int numberOfContours, VectorPath path, in Matrix3x2 transform)
+    private void ParseSimpleGlyph(int offset, int glyphLength, int numberOfContours, VectorPath path, in Matrix3x2 transform)
     {
+        int glyphEnd = Math.Min(_fontData.Length, offset + glyphLength);
         int readPos = offset + 10;
+
+        if ((long)readPos + (long)numberOfContours * 2 + 2 > glyphEnd)
+            throw new InvalidDataException("Truncated TrueType simple glyph contour table.");
+
         ushort[] endPtsOfContours = new ushort[numberOfContours];
         for (int i = 0; i < numberOfContours; i++)
         {
-            endPtsOfContours[i] = BinaryPrimitives.ReadUInt16BigEndian(_fontData.AsSpan(readPos, 2));
+            ushort endPt = BinaryPrimitives.ReadUInt16BigEndian(_fontData.AsSpan(readPos, 2));
+            if (i > 0 && endPt < endPtsOfContours[i - 1])
+                throw new InvalidDataException("TrueType glyph endPtsOfContours are not monotonic non-decreasing.");
+            endPtsOfContours[i] = endPt;
             readPos += 2;
         }
 
         int numPoints = endPtsOfContours[^1] + 1;
+        if (readPos + 2 > glyphEnd)
+            throw new InvalidDataException("Truncated TrueType simple glyph instructionLength.");
+
         ushort instructionLength = BinaryPrimitives.ReadUInt16BigEndian(_fontData.AsSpan(readPos, 2));
-        readPos += 2 + instructionLength; // Skip hinting instructions
+        readPos += 2;
+        if ((long)readPos + instructionLength > glyphEnd)
+            throw new InvalidDataException("TrueType simple glyph instructions exceed glyph bounds.");
+        readPos += instructionLength; // Skip hinting instructions
 
         // Read flags
         byte[] flags = new byte[numPoints];
         for (int i = 0; i < numPoints; i++)
         {
+            if (readPos >= glyphEnd)
+                throw new InvalidDataException("TrueType simple glyph flags exceed glyph bounds.");
+
             byte flag = _fontData[readPos++];
             flags[i] = flag;
             if ((flag & 0x08) != 0) // Repeat flag
             {
+                if (readPos >= glyphEnd)
+                    throw new InvalidDataException("TrueType simple glyph flag repeat count truncated.");
+
                 byte repeatCount = _fontData[readPos++];
+                if (i + repeatCount >= numPoints)
+                    throw new InvalidDataException($"TrueType simple glyph flag repeat count ({repeatCount}) exceeds point count ({numPoints}).");
+
                 for (int r = 0; r < repeatCount; r++)
                 {
                     flags[++i] = flag;
@@ -357,11 +421,15 @@ public sealed class TrueTypeFont
 
             if (isShort)
             {
+                if (readPos >= glyphEnd)
+                    throw new InvalidDataException("TrueType simple glyph X coordinates exceed glyph bounds.");
                 byte val = _fontData[readPos++];
                 currentX += (short)(sameOrPos ? val : -val);
             }
             else if (!sameOrPos)
             {
+                if (readPos + 2 > glyphEnd)
+                    throw new InvalidDataException("TrueType simple glyph X coordinates exceed glyph bounds.");
                 short val = BinaryPrimitives.ReadInt16BigEndian(_fontData.AsSpan(readPos, 2));
                 readPos += 2;
                 currentX += val;
@@ -380,11 +448,15 @@ public sealed class TrueTypeFont
 
             if (isShort)
             {
+                if (readPos >= glyphEnd)
+                    throw new InvalidDataException("TrueType simple glyph Y coordinates exceed glyph bounds.");
                 byte val = _fontData[readPos++];
                 currentY += (short)(sameOrPos ? val : -val);
             }
             else if (!sameOrPos)
             {
+                if (readPos + 2 > glyphEnd)
+                    throw new InvalidDataException("TrueType simple glyph Y coordinates exceed glyph bounds.");
                 short val = BinaryPrimitives.ReadInt16BigEndian(_fontData.AsSpan(readPos, 2));
                 readPos += 2;
                 currentY += val;
@@ -397,6 +469,8 @@ public sealed class TrueTypeFont
         for (int c = 0; c < numberOfContours; c++)
         {
             int endPt = endPtsOfContours[c];
+            if (endPt >= numPoints || startPt > endPt + 1)
+                throw new InvalidDataException("Invalid contour point range in TrueType glyph.");
             int count = endPt - startPt + 1;
             if (count > 0)
             {
@@ -502,8 +576,9 @@ public sealed class TrueTypeFont
         path.Close();
     }
 
-    private void ParseCompositeGlyph(int offset, VectorPath path, in Matrix3x2 transform, int depth)
+    private void ParseCompositeGlyph(int offset, int glyphLength, VectorPath path, in Matrix3x2 transform, int depth)
     {
+        int glyphEnd = Math.Min(_fontData.Length, offset + glyphLength);
         int readPos = offset + 10;
         const ushort ARG_1_AND_2_ARE_WORDS = 0x0001;
         const ushort ARGS_ARE_XY_VALUES = 0x0002;
@@ -515,12 +590,19 @@ public sealed class TrueTypeFont
         ushort flags;
         do
         {
+            if (readPos + 4 > glyphEnd)
+                throw new InvalidDataException("Truncated TrueType composite glyph component header.");
+
             flags = BinaryPrimitives.ReadUInt16BigEndian(_fontData.AsSpan(readPos, 2));
             ushort compGlyphIndex = BinaryPrimitives.ReadUInt16BigEndian(_fontData.AsSpan(readPos + 2, 2));
             readPos += 4;
 
             float m11 = 1f, m12 = 0f, m21 = 0f, m22 = 1f;
             float dx = 0f, dy = 0f;
+
+            int argBytes = (flags & ARG_1_AND_2_ARE_WORDS) != 0 ? 4 : 2;
+            if (readPos + argBytes > glyphEnd)
+                throw new InvalidDataException("Truncated TrueType composite glyph arguments.");
 
             if ((flags & ARGS_ARE_XY_VALUES) != 0)
             {
@@ -539,11 +621,13 @@ public sealed class TrueTypeFont
             else
             {
                 // Point matching offsets
-                readPos += (flags & ARG_1_AND_2_ARE_WORDS) != 0 ? 4 : 2;
+                readPos += argBytes;
             }
 
             if ((flags & WE_HAVE_A_SCALE) != 0)
             {
+                if (readPos + 2 > glyphEnd)
+                    throw new InvalidDataException("Truncated TrueType composite glyph scale.");
                 float scale = BinaryPrimitives.ReadInt16BigEndian(_fontData.AsSpan(readPos, 2)) / 16384f;
                 readPos += 2;
                 m11 = scale;
@@ -551,12 +635,16 @@ public sealed class TrueTypeFont
             }
             else if ((flags & WE_HAVE_AN_X_AND_Y_SCALE) != 0)
             {
+                if (readPos + 4 > glyphEnd)
+                    throw new InvalidDataException("Truncated TrueType composite glyph X/Y scale.");
                 m11 = BinaryPrimitives.ReadInt16BigEndian(_fontData.AsSpan(readPos, 2)) / 16384f;
                 m22 = BinaryPrimitives.ReadInt16BigEndian(_fontData.AsSpan(readPos + 2, 2)) / 16384f;
                 readPos += 4;
             }
             else if ((flags & WE_HAVE_A_TWO_BY_TWO) != 0)
             {
+                if (readPos + 8 > glyphEnd)
+                    throw new InvalidDataException("Truncated TrueType composite glyph 2x2 transform.");
                 m11 = BinaryPrimitives.ReadInt16BigEndian(_fontData.AsSpan(readPos, 2)) / 16384f;
                 m12 = BinaryPrimitives.ReadInt16BigEndian(_fontData.AsSpan(readPos + 2, 2)) / 16384f;
                 m21 = BinaryPrimitives.ReadInt16BigEndian(_fontData.AsSpan(readPos + 4, 2)) / 16384f;
@@ -574,7 +662,10 @@ public sealed class TrueTypeFont
 
     public ReadOnlySpan<byte> GetTableData(string tag)
     {
-        if (_tables.TryGetValue(tag, out var entry))
+        if (_tables.TryGetValue(tag, out var entry)
+            && entry.Offset >= 0
+            && entry.Length >= 0
+            && (long)entry.Offset + entry.Length <= _fontData.Length)
         {
             return _fontData.AsSpan(entry.Offset, entry.Length);
         }

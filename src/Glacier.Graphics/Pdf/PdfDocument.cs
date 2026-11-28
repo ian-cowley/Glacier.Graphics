@@ -5,7 +5,7 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.IO.Compression;
-using System.Text;
+using System.Runtime.InteropServices;
 using Glacier.Graphics.Text;
 
 /// <summary>
@@ -30,10 +30,11 @@ public enum PdfBlendMode
 /// <summary>
 /// Single page within a vector PDF document.
 /// </summary>
-public sealed class PdfPage
+public sealed class PdfPage : IDisposable
 {
-    private readonly MemoryStream _contentStream = new();
+    private readonly PooledBufferWriter _contentWriter = new();
     private readonly Dictionary<string, (float Alpha, PdfBlendMode Mode)> _extGStates = new();
+    private bool _disposed;
 
     public float Width { get; }
     public float Height { get; }
@@ -50,15 +51,16 @@ public sealed class PdfPage
 
     internal void AppendCommand(string cmd)
     {
+        ObjectDisposedException.ThrowIf(_disposed, this);
         // Use Latin1 (1:1 single-byte mapping 0x00..0xFF) instead of ASCII so bytes >= 0x80 are never mangled into '?' (0x3F).
-        byte[] bytes = Encoding.Latin1.GetBytes(cmd);
-        _contentStream.Write(bytes, 0, bytes.Length);
-        _contentStream.WriteByte((byte)'\n');
+        Pdf17Writer.WriteLatin1(_contentWriter, cmd);
+        _contentWriter.WriteByte((byte)'\n');
     }
 
     internal void AppendBytes(ReadOnlySpan<byte> rawBytes)
     {
-        _contentStream.Write(rawBytes);
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        _contentWriter.Write(rawBytes);
     }
 
     internal string RegisterExtGState(float alpha, PdfBlendMode mode)
@@ -73,34 +75,46 @@ public sealed class PdfPage
 
     internal IReadOnlyDictionary<string, (float Alpha, PdfBlendMode Mode)> ExtGStates => _extGStates;
 
-    internal byte[] GetRawContent() => _contentStream.ToArray();
-
-    internal byte[] GetCompressedContent()
+    internal byte[] GetRawContent()
     {
-        byte[] raw = _contentStream.ToArray();
-        using var ms = new MemoryStream();
-        using (var zlib = new ZLibStream(ms, CompressionLevel.Fastest, leaveOpen: true))
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        return _contentWriter.ToArray();
+    }
+
+    internal void CompressContentTo(PooledBufferWriter target)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        using var zlib = new ZLibStream(new PooledBufferStream(target), CompressionLevel.Fastest, leaveOpen: true);
+        _contentWriter.CopyTo(zlib);
+    }
+
+    public void Dispose()
+    {
+        if (!_disposed)
         {
-            zlib.Write(raw, 0, raw.Length);
+            _contentWriter.Dispose();
+            _disposed = true;
         }
-        return ms.ToArray();
     }
 }
 
 /// <summary>
-/// High-throughput PDF 1.7 / 2.0 document generator with Flate stream compression,
-/// vector paths, embedded TrueType fonts, lossless RGB image embedding, and ExtGState transparency.
+/// High-throughput PDF 1.7 document generator with Flate stream compression,
+/// embedded raw TrueType fonts, ASCIIHex lossless inline RGB images, and ExtGState transparency.
+/// Backed by pooled buffers (<see cref="PooledBufferWriter"/>).
 /// </summary>
-public sealed class PdfDocument
+public sealed class PdfDocument : IDisposable
 {
     private readonly List<PdfPage> _pages = new();
     private readonly List<TrueTypeFont> _embeddedFonts = new();
     private readonly List<long> _objectOffsets = new();
+    private bool _disposed;
 
     public IReadOnlyList<PdfPage> Pages => _pages;
 
     public PdfPage AddPage(float width = 612f, float height = 792f)
     {
+        ObjectDisposedException.ThrowIf(_disposed, this);
         var page = new PdfPage(width, height);
         _pages.Add(page);
         return page;
@@ -108,6 +122,7 @@ public sealed class PdfDocument
 
     public void EmbedFont(TrueTypeFont font)
     {
+        ObjectDisposedException.ThrowIf(_disposed, this);
         if (font != null && !_embeddedFonts.Contains(font))
         {
             _embeddedFonts.Add(font);
@@ -133,21 +148,28 @@ public sealed class PdfDocument
 
     public byte[] Save()
     {
-        using var ms = new MemoryStream();
-        Save(ms);
-        return ms.ToArray();
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        using var docWriter = new PooledBufferWriter();
+        WritePdf(docWriter);
+        return docWriter.ToArray();
     }
 
     public void Save(Stream output)
     {
-        // Use Latin1 so the 4 high-bit PDF binary header bytes (%\xE2\xE3\xCF\xD3) are preserved verbatim.
-        using var writer = new StreamWriter(output, Encoding.Latin1, leaveOpen: true);
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        ArgumentNullException.ThrowIfNull(output);
+
+        using var docWriter = new PooledBufferWriter();
+        WritePdf(docWriter);
+        docWriter.CopyTo(output);
+    }
+
+    private void WritePdf(PooledBufferWriter w)
+    {
         _objectOffsets.Clear();
         _objectOffsets.Add(0); // Object 0 is free root entry
 
-        writer.Write("%PDF-1.7\n");
-        writer.Write("%\u00E2\u00E3\u00CF\u00D3\n");
-        writer.Flush();
+        Pdf17Writer.WriteHeader(w);
 
         int nextObj = 1;
         int catalogObj = nextObj++;
@@ -166,76 +188,97 @@ public sealed class PdfDocument
 
         int fallbackHelveticaObj = anyFallbackFont ? nextObj++ : 0;
 
-        var fontObjMap = new Dictionary<TrueTypeFont, (int FontObj, int FileObj)>();
+        var fontObjMap = new Dictionary<TrueTypeFont, (int FontObj, int FileObj)>(_embeddedFonts.Count);
         foreach (var font in _embeddedFonts)
         {
             fontObjMap[font] = (nextObj++, nextObj++);
         }
 
-        WriteObjectHeader(writer, output, catalogObj);
-        writer.Write($"<< /Type /Catalog /Pages {pagesObj} 0 R >>\nendobj\n");
-        writer.Flush();
+        WriteObjectHeader(w, catalogObj);
+        Pdf17Writer.WriteAscii(w, "<< /Type /Catalog /Pages "u8);
+        Pdf17Writer.WriteInt32(w, pagesObj);
+        Pdf17Writer.WriteAscii(w, " 0 R >>\nendobj\n"u8);
 
-        WriteObjectHeader(writer, output, pagesObj);
-        writer.Write("<< /Type /Pages /Kids [");
+        WriteObjectHeader(w, pagesObj);
+        Pdf17Writer.WriteAscii(w, "<< /Type /Pages /Kids ["u8);
         foreach (var p in _pages)
         {
-            writer.Write($"{p.PageObjectNumber} 0 R ");
+            Pdf17Writer.WriteInt32(w, p.PageObjectNumber);
+            Pdf17Writer.WriteAscii(w, " 0 R "u8);
         }
-        writer.Write($"] /Count {_pages.Count} >>\nendobj\n");
-        writer.Flush();
+        Pdf17Writer.WriteAscii(w, "] /Count "u8);
+        Pdf17Writer.WriteInt32(w, _pages.Count);
+        Pdf17Writer.WriteAscii(w, " >>\nendobj\n"u8);
 
         if (anyFallbackFont)
         {
-            WriteObjectHeader(writer, output, fallbackHelveticaObj);
-            writer.Write("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>\nendobj\n");
-            writer.Flush();
+            WriteObjectHeader(w, fallbackHelveticaObj);
+            Pdf17Writer.WriteAscii(w, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>\nendobj\n"u8);
         }
+
+        using var compressedContent = new PooledBufferWriter();
 
         for (int i = 0; i < _pages.Count; i++)
         {
             var page = _pages[i];
 
-            WriteObjectHeader(writer, output, page.PageObjectNumber);
-            writer.Write($"<< /Type /Page /Parent {pagesObj} 0 R\n");
-            writer.Write(string.Format(CultureInfo.InvariantCulture, "/MediaBox [0 0 {0:0.##} {1:0.##}]\n", page.Width, page.Height));
-            writer.Write($"/Contents {page.ContentObjectNumber} 0 R\n");
+            WriteObjectHeader(w, page.PageObjectNumber);
+            Pdf17Writer.WriteAscii(w, "<< /Type /Page /Parent "u8);
+            Pdf17Writer.WriteInt32(w, pagesObj);
+            Pdf17Writer.WriteAscii(w, " 0 R\n/MediaBox [0 0 "u8);
+            Pdf17Writer.WriteFloatCompact(w, page.Width);
+            Pdf17Writer.WriteAscii(w, " "u8);
+            Pdf17Writer.WriteFloatCompact(w, page.Height);
+            Pdf17Writer.WriteAscii(w, "]\n/Contents "u8);
+            Pdf17Writer.WriteInt32(w, page.ContentObjectNumber);
+            Pdf17Writer.WriteAscii(w, " 0 R\n/Resources << /Font << "u8);
 
-            writer.Write("/Resources << /Font << ");
             if (page.UsesStandardFallbackFont)
             {
-                writer.Write($"/F0 {fallbackHelveticaObj} 0 R ");
+                Pdf17Writer.WriteAscii(w, "/F0 "u8);
+                Pdf17Writer.WriteInt32(w, fallbackHelveticaObj);
+                Pdf17Writer.WriteAscii(w, " 0 R "u8);
             }
             for (int f = 0; f < _embeddedFonts.Count; f++)
             {
                 var info = fontObjMap[_embeddedFonts[f]];
-                writer.Write($"/F{f + 1} {info.FontObj} 0 R ");
+                Pdf17Writer.WriteAscii(w, "/F"u8);
+                Pdf17Writer.WriteInt32(w, f + 1);
+                Pdf17Writer.WriteAscii(w, " "u8);
+                Pdf17Writer.WriteInt32(w, info.FontObj);
+                Pdf17Writer.WriteAscii(w, " 0 R "u8);
             }
-            writer.Write(">> ");
+            Pdf17Writer.WriteAscii(w, ">> "u8);
 
             if (page.ExtGStates.Count > 0)
             {
-                writer.Write("/ExtGState << ");
+                Pdf17Writer.WriteAscii(w, "/ExtGState << "u8);
                 foreach (var kvp in page.ExtGStates)
                 {
-                    writer.Write(string.Format(
-                        CultureInfo.InvariantCulture,
-                        "/{0} << /Type /ExtGState /ca {1:0.##} /CA {1:0.##} /BM /{2} >> ",
-                        kvp.Key, kvp.Value.Alpha, kvp.Value.Mode));
+                    Pdf17Writer.WriteAscii(w, "/");
+                    Pdf17Writer.WriteAscii(w, kvp.Key);
+                    Pdf17Writer.WriteAscii(w, " << /Type /ExtGState /ca "u8);
+                    Pdf17Writer.WriteFloatCompact(w, kvp.Value.Alpha);
+                    Pdf17Writer.WriteAscii(w, " /CA "u8);
+                    Pdf17Writer.WriteFloatCompact(w, kvp.Value.Alpha);
+                    Pdf17Writer.WriteAscii(w, " /BM /"u8);
+                    Pdf17Writer.WriteAscii(w, kvp.Value.Mode.ToString());
+                    Pdf17Writer.WriteAscii(w, " >> "u8);
                 }
-                writer.Write(">> ");
+                Pdf17Writer.WriteAscii(w, ">> "u8);
             }
 
-            writer.Write(">> >>\nendobj\n");
-            writer.Flush();
+            Pdf17Writer.WriteAscii(w, ">> >>\nendobj\n"u8);
 
-            byte[] compressed = page.GetCompressedContent();
-            WriteObjectHeader(writer, output, page.ContentObjectNumber);
-            writer.Write($"<< /Length {compressed.Length} /Filter /FlateDecode >>\nstream\n");
-            writer.Flush();
-            output.Write(compressed, 0, compressed.Length);
-            writer.Write("\nendstream\nendobj\n");
-            writer.Flush();
+            compressedContent.Reset();
+            page.CompressContentTo(compressedContent);
+
+            WriteObjectHeader(w, page.ContentObjectNumber);
+            Pdf17Writer.WriteAscii(w, "<< /Length "u8);
+            Pdf17Writer.WriteInt32(w, compressedContent.WrittenCount);
+            Pdf17Writer.WriteAscii(w, " /Filter /FlateDecode >>\nstream\n"u8);
+            compressedContent.CopyTo(w);
+            Pdf17Writer.WriteAscii(w, "\nendstream\nendobj\n"u8);
         }
 
         foreach (var kvp in fontObjMap)
@@ -245,53 +288,54 @@ public sealed class PdfDocument
 
             ReadOnlyMemory<byte> fontBytes = font.FontData;
 
-            WriteObjectHeader(writer, output, fileObj);
-            writer.Write($"<< /Length {fontBytes.Length} /Length1 {fontBytes.Length} >>\nstream\n");
-            writer.Flush();
-            output.Write(fontBytes.Span);
-            writer.Write("\nendstream\nendobj\n");
-            writer.Flush();
+            WriteObjectHeader(w, fileObj);
+            Pdf17Writer.WriteAscii(w, "<< /Length "u8);
+            Pdf17Writer.WriteInt32(w, fontBytes.Length);
+            Pdf17Writer.WriteAscii(w, " /Length1 "u8);
+            Pdf17Writer.WriteInt32(w, fontBytes.Length);
+            Pdf17Writer.WriteAscii(w, " >>\nstream\n"u8);
+            w.Write(fontBytes.Span);
+            Pdf17Writer.WriteAscii(w, "\nendstream\nendobj\n"u8);
 
-            WriteObjectHeader(writer, output, fontObj);
-            writer.Write("<< /Type /Font /Subtype /TrueType\n");
-            writer.Write("/BaseFont /GlacierFont\n");
-            writer.Write($"/FontFile2 {fileObj} 0 R\n");
-            writer.Write("/FirstChar 32 /LastChar 255\n");
-            writer.Write("/Widths [");
+            WriteObjectHeader(w, fontObj);
+            Pdf17Writer.WriteAscii(w, "<< /Type /Font /Subtype /TrueType\n/BaseFont /GlacierFont\n/FontFile2 "u8);
+            Pdf17Writer.WriteInt32(w, fileObj);
+            Pdf17Writer.WriteAscii(w, " 0 R\n/FirstChar 32 /LastChar 255\n/Widths ["u8);
             for (int c = 32; c <= 255; c++)
             {
-                int gid = font.GetGlyphIndex(c);
-                ushort adv = font.GetAdvanceWidth(gid);
-                int pdfWidth = (int)Math.Round((adv * 1000.0) / font.UnitsPerEm);
-                writer.Write($"{pdfWidth} ");
+                Pdf17Writer.WriteInt32(w, font.GetPdfWidth(c));
+                w.WriteByte((byte)' ');
             }
-            writer.Write("]\n");
-            writer.Write(">>\nendobj\n");
-            writer.Flush();
+            Pdf17Writer.WriteAscii(w, "]\n>>\nendobj\n"u8);
         }
 
-        long xrefStart = output.Position;
-        writer.Write($"xref\n0 {_objectOffsets.Count}\n");
-        writer.Write("0000000000 65535 f \n");
-        for (int i = 1; i < _objectOffsets.Count; i++)
-        {
-            writer.Write(string.Format(CultureInfo.InvariantCulture, "{0:D10} 00000 n \n", _objectOffsets[i]));
-        }
-
-        writer.Write("trailer\n");
-        writer.Write($"<< /Size {_objectOffsets.Count} /Root {catalogObj} 0 R >>\n");
-        writer.Write($"startxref\n{xrefStart}\n%%EOF\n");
-        writer.Flush();
+        long xrefStart = w.WrittenLength;
+        Pdf17Writer.WriteXrefAndTrailer(w, CollectionsMarshal.AsSpan(_objectOffsets), _objectOffsets.Count, catalogObj, xrefStart);
     }
 
-    private void WriteObjectHeader(StreamWriter writer, Stream output, int objectNumber)
+    private void WriteObjectHeader(PooledBufferWriter w, int objectNumber)
     {
-        writer.Flush();
         while (_objectOffsets.Count <= objectNumber)
         {
             _objectOffsets.Add(0);
         }
-        _objectOffsets[objectNumber] = output.Position;
-        writer.Write($"{objectNumber} 0 obj\n");
+        _objectOffsets[objectNumber] = w.WrittenLength;
+        Pdf17Writer.WriteInt32(w, objectNumber);
+        Pdf17Writer.WriteAscii(w, " 0 obj\n"u8);
+    }
+
+    public void Dispose()
+    {
+        if (!_disposed)
+        {
+            foreach (var page in _pages)
+            {
+                page.Dispose();
+            }
+            _pages.Clear();
+            _embeddedFonts.Clear();
+            _objectOffsets.Clear();
+            _disposed = true;
+        }
     }
 }

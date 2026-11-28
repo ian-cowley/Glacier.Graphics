@@ -1,13 +1,12 @@
 ﻿using System.Buffers;
 using System.IO.Compression;
-using System.Text;
 
 namespace Glacier.Graphics.Pdf;
 
 public partial class TinyPdfCreate
 {
     /// <summary>
-    /// A builder for constructing PDF documents page by page.
+    /// A builder for constructing PDF 1.7 documents page by page backed by <see cref="PooledBufferWriter"/>.
     /// </summary>
     public partial class Builder
     {
@@ -15,8 +14,8 @@ public partial class TinyPdfCreate
         /// Gets or sets whether to compress the generated PDF objects. Defaults to true.
         /// </summary>
         public bool Compress { get; set; } = true;
-        private List<PdfObject> _objects = new List<PdfObject>();
-        private List<Ref> _pages = new List<Ref>();
+        private readonly List<PdfObject> _objects = new List<PdfObject>();
+        private readonly List<Ref> _pages = new List<Ref>();
         private int _nextId = 1;
 
         public Ref AddObject(Dictionary<string, object> dict, byte[]? streamBytes = null)
@@ -35,7 +34,7 @@ public partial class TinyPdfCreate
         /// <param name="fn">An action that takes an <see cref="IPageContext"/> to draw on the page.</param>
         public void Page(double width, double height, Action<IPageContext> fn)
         {
-            var writer = new ArrayBufferWriter<byte>(1024);
+            using var writer = new Glacier.Graphics.Pdf.PooledBufferWriter();
             var images = new List<(string Name, Ref Ref)>();
             var links = new List<(string Url, double[] Rect)>();
             int imageCount = 0;
@@ -43,7 +42,7 @@ public partial class TinyPdfCreate
             var ctx = new PageContextImpl(this, writer, images, imageCount, (newCount) => imageCount = newCount, links);
             fn(ctx);
 
-            var contentBytes = writer.WrittenSpan.ToArray();
+            byte[] contentBytes = writer.ToArray();
             var contentRef = AddObject(new Dictionary<string, object> { ["Length"] = contentBytes.Length }, contentBytes);
 
             var xobjects = new Dictionary<string, object>();
@@ -70,7 +69,7 @@ public partial class TinyPdfCreate
             var pageDict = new Dictionary<string, object>
             {
                 ["Type"] = "/Page",
-                ["Parent"] = null!, // Will be set in build
+                ["Parent"] = null!, // Will be set in Build
                 ["MediaBox"] = new List<double> { 0, 0, width, height },
                 ["Contents"] = contentRef,
                 ["Resources"] = new Dictionary<string, object>
@@ -82,7 +81,6 @@ public partial class TinyPdfCreate
             if (annots.Count > 0) pageDict["Annots"] = annots;
 
             var pageRef = AddObject(pageDict);
-
             _pages.Add(pageRef);
         }
 
@@ -101,32 +99,44 @@ public partial class TinyPdfCreate
         public double MeasureText(string str, double size) => TinyPdfCreate.MeasureText(str, size);
 
         /// <summary>
-        /// Finalizes the PDF construction and returns the raw bytes of the PDF document.
+        /// Finalizes the PDF 1.7 construction and returns the raw bytes of the PDF document.
         /// </summary>
         /// <returns>The raw bytes of the generated PDF document.</returns>
         public byte[] Build()
         {
-            var fontMap = new Dictionary<PdfFont, Ref>();
-            fontMap[PdfFont.Helvetica] = AddObject(new Dictionary<string, object> { ["Type"] = "/Font", ["Subtype"] = "/Type1", ["BaseFont"] = "/Helvetica", ["Encoding"] = "/WinAnsiEncoding" });
-            fontMap[PdfFont.Times] = AddObject(new Dictionary<string, object> { ["Type"] = "/Font", ["Subtype"] = "/Type1", ["BaseFont"] = "/Times-Roman", ["Encoding"] = "/WinAnsiEncoding" });
-            fontMap[PdfFont.Courier] = AddObject(new Dictionary<string, object> { ["Type"] = "/Font", ["Subtype"] = "/Type1", ["BaseFont"] = "/Courier", ["Encoding"] = "/WinAnsiEncoding" });
-            fontMap[PdfFont.HelveticaBold] = AddObject(new Dictionary<string, object> { ["Type"] = "/Font", ["Subtype"] = "/Type1", ["BaseFont"] = "/Helvetica-Bold", ["Encoding"] = "/WinAnsiEncoding" });
-            fontMap[PdfFont.HelveticaOblique] = AddObject(new Dictionary<string, object> { ["Type"] = "/Font", ["Subtype"] = "/Type1", ["BaseFont"] = "/Helvetica-Oblique", ["Encoding"] = "/WinAnsiEncoding" });
-            fontMap[PdfFont.HelveticaBoldOblique] = AddObject(new Dictionary<string, object> { ["Type"] = "/Font", ["Subtype"] = "/Type1", ["BaseFont"] = "/Helvetica-BoldOblique", ["Encoding"] = "/WinAnsiEncoding" });
-            fontMap[PdfFont.TimesBold] = AddObject(new Dictionary<string, object> { ["Type"] = "/Font", ["Subtype"] = "/Type1", ["BaseFont"] = "/Times-Bold", ["Encoding"] = "/WinAnsiEncoding" });
-            fontMap[PdfFont.TimesItalic] = AddObject(new Dictionary<string, object> { ["Type"] = "/Font", ["Subtype"] = "/Type1", ["BaseFont"] = "/Times-Italic", ["Encoding"] = "/WinAnsiEncoding" });
-            fontMap[PdfFont.TimesBoldItalic] = AddObject(new Dictionary<string, object> { ["Type"] = "/Font", ["Subtype"] = "/Type1", ["BaseFont"] = "/Times-BoldItalic", ["Encoding"] = "/WinAnsiEncoding" });
-            fontMap[PdfFont.CourierBold] = AddObject(new Dictionary<string, object> { ["Type"] = "/Font", ["Subtype"] = "/Type1", ["BaseFont"] = "/Courier-Bold", ["Encoding"] = "/WinAnsiEncoding" });
-            fontMap[PdfFont.CourierOblique] = AddObject(new Dictionary<string, object> { ["Type"] = "/Font", ["Subtype"] = "/Type1", ["BaseFont"] = "/Courier-Oblique", ["Encoding"] = "/WinAnsiEncoding" });
-            fontMap[PdfFont.CourierBoldOblique] = AddObject(new Dictionary<string, object> { ["Type"] = "/Font", ["Subtype"] = "/Type1", ["BaseFont"] = "/Courier-BoldOblique", ["Encoding"] = "/WinAnsiEncoding" });
-            fontMap[PdfFont.Symbol] = AddObject(new Dictionary<string, object> { ["Type"] = "/Font", ["Subtype"] = "/Type1", ["BaseFont"] = "/Symbol" });
-            fontMap[PdfFont.ZapfDingbats] = AddObject(new Dictionary<string, object> { ["Type"] = "/Font", ["Subtype"] = "/Type1", ["BaseFont"] = "/ZapfDingbats" });
+            int transientId = _nextId;
+            var transientObjects = new List<PdfObject>(16);
 
-            var pagesRef = AddObject(new Dictionary<string, object> { ["Type"] = "/Pages", ["Kids"] = _pages, ["Count"] = _pages.Count });
+            Ref AddTransient(Dictionary<string, object> dict)
+            {
+                int id = transientId++;
+                transientObjects.Add(new PdfObject { Id = id, Dict = dict });
+                return new Ref(id);
+            }
+
+            var fontMap = new Dictionary<PdfFont, Ref>(14)
+            {
+                [PdfFont.Helvetica] = AddTransient(new Dictionary<string, object> { ["Type"] = "/Font", ["Subtype"] = "/Type1", ["BaseFont"] = "/Helvetica", ["Encoding"] = "/WinAnsiEncoding" }),
+                [PdfFont.Times] = AddTransient(new Dictionary<string, object> { ["Type"] = "/Font", ["Subtype"] = "/Type1", ["BaseFont"] = "/Times-Roman", ["Encoding"] = "/WinAnsiEncoding" }),
+                [PdfFont.Courier] = AddTransient(new Dictionary<string, object> { ["Type"] = "/Font", ["Subtype"] = "/Type1", ["BaseFont"] = "/Courier", ["Encoding"] = "/WinAnsiEncoding" }),
+                [PdfFont.HelveticaBold] = AddTransient(new Dictionary<string, object> { ["Type"] = "/Font", ["Subtype"] = "/Type1", ["BaseFont"] = "/Helvetica-Bold", ["Encoding"] = "/WinAnsiEncoding" }),
+                [PdfFont.HelveticaOblique] = AddTransient(new Dictionary<string, object> { ["Type"] = "/Font", ["Subtype"] = "/Type1", ["BaseFont"] = "/Helvetica-Oblique", ["Encoding"] = "/WinAnsiEncoding" }),
+                [PdfFont.HelveticaBoldOblique] = AddTransient(new Dictionary<string, object> { ["Type"] = "/Font", ["Subtype"] = "/Type1", ["BaseFont"] = "/Helvetica-BoldOblique", ["Encoding"] = "/WinAnsiEncoding" }),
+                [PdfFont.TimesBold] = AddTransient(new Dictionary<string, object> { ["Type"] = "/Font", ["Subtype"] = "/Type1", ["BaseFont"] = "/Times-Bold", ["Encoding"] = "/WinAnsiEncoding" }),
+                [PdfFont.TimesItalic] = AddTransient(new Dictionary<string, object> { ["Type"] = "/Font", ["Subtype"] = "/Type1", ["BaseFont"] = "/Times-Italic", ["Encoding"] = "/WinAnsiEncoding" }),
+                [PdfFont.TimesBoldItalic] = AddTransient(new Dictionary<string, object> { ["Type"] = "/Font", ["Subtype"] = "/Type1", ["BaseFont"] = "/Times-BoldItalic", ["Encoding"] = "/WinAnsiEncoding" }),
+                [PdfFont.CourierBold] = AddTransient(new Dictionary<string, object> { ["Type"] = "/Font", ["Subtype"] = "/Type1", ["BaseFont"] = "/Courier-Bold", ["Encoding"] = "/WinAnsiEncoding" }),
+                [PdfFont.CourierOblique] = AddTransient(new Dictionary<string, object> { ["Type"] = "/Font", ["Subtype"] = "/Type1", ["BaseFont"] = "/Courier-Oblique", ["Encoding"] = "/WinAnsiEncoding" }),
+                [PdfFont.CourierBoldOblique] = AddTransient(new Dictionary<string, object> { ["Type"] = "/Font", ["Subtype"] = "/Type1", ["BaseFont"] = "/Courier-BoldOblique", ["Encoding"] = "/WinAnsiEncoding" }),
+                [PdfFont.Symbol] = AddTransient(new Dictionary<string, object> { ["Type"] = "/Font", ["Subtype"] = "/Type1", ["BaseFont"] = "/Symbol" }),
+                [PdfFont.ZapfDingbats] = AddTransient(new Dictionary<string, object> { ["Type"] = "/Font", ["Subtype"] = "/Type1", ["BaseFont"] = "/ZapfDingbats" })
+            };
+
+            var pagesRef = AddTransient(new Dictionary<string, object> { ["Type"] = "/Pages", ["Kids"] = _pages, ["Count"] = _pages.Count });
 
             foreach (var obj in _objects)
             {
-                if (obj.Dict.TryGetValue("Type", out var type) && type.ToString() == "/Page")
+                if (obj.Dict.TryGetValue("Type", out var type) && type?.ToString() == "/Page")
                 {
                     obj.Dict["Parent"] = pagesRef;
                     if (obj.Dict.TryGetValue("Resources", out var resObj) && resObj is Dictionary<string, object> resources)
@@ -143,22 +153,25 @@ public partial class TinyPdfCreate
                 }
             }
 
-            var catalogRef = AddObject(new Dictionary<string, object> { ["Type"] = "/Catalog", ["Pages"] = pagesRef });
+            var catalogRef = AddTransient(new Dictionary<string, object> { ["Type"] = "/Catalog", ["Pages"] = pagesRef });
 
-            var offsets = new int[_objects.Count + 1];
-            var headerBytes = new byte[] { (byte)'%', (byte)'P', (byte)'D', (byte)'F', (byte)'-', (byte)'1', (byte)'.', (byte)'4', (byte)'\n', (byte)'%', 0xFF, 0xFF, 0xFF, 0xFF, (byte)'\n' };
+            int totalObjects = transientId - 1;
+            var offsets = new long[totalObjects + 1];
 
-            using var ms = new MemoryStream();
-            ms.Write(headerBytes, 0, headerBytes.Length);
+            using var docWriter = new Glacier.Graphics.Pdf.PooledBufferWriter();
+            using var compWriter = new Glacier.Graphics.Pdf.PooledBufferWriter();
 
-            foreach (var obj in _objects)
+            Pdf17Writer.WriteHeader(docWriter);
+
+            void EmitObject(PdfObject obj)
             {
-                offsets[obj.Id] = (int)ms.Position;
+                offsets[obj.Id] = docWriter.WrittenLength;
+                Pdf17Writer.WriteInt32(docWriter, obj.Id);
+                Pdf17Writer.WriteAscii(docWriter, " 0 obj\n"u8);
 
                 if (obj.Stream != null)
                 {
                     byte[] streamData = obj.Stream;
-                    PooledBufferWriter? pbw = null;
                     // Never overwrite pre-encoded streams (e.g., JPEG /DCTDecode XObjects) with /FlateDecode!
                     bool hasPreEncodedFilter = obj.Dict.TryGetValue("Filter", out var existingFilter)
                         && existingFilter?.ToString() != "/FlateDecode";
@@ -166,14 +179,13 @@ public partial class TinyPdfCreate
 
                     if (shouldCompress)
                     {
-                        pbw = new PooledBufferWriter();
-                        using (var zs = new ZLibStream(new PooledBufferStream(pbw), CompressionLevel.Optimal, leaveOpen: true))
+                        compWriter.Reset();
+                        using (var zs = new ZLibStream(new PooledBufferStream(compWriter), CompressionLevel.Optimal, leaveOpen: true))
                         {
                             zs.Write(streamData, 0, streamData.Length);
                         }
-                        int compressedLen = pbw.WrittenCount;
                         obj.Dict["Filter"] = "/FlateDecode";
-                        obj.Dict["Length"] = compressedLen;
+                        obj.Dict["Length"] = compWriter.WrittenCount;
                     }
                     else
                     {
@@ -184,53 +196,34 @@ public partial class TinyPdfCreate
                         obj.Dict["Length"] = streamData.Length;
                     }
 
-                    var header = Encoding.UTF8.GetBytes($"{obj.Id} 0 obj\n");
-                    ms.Write(header, 0, header.Length);
+                    SerializeToWriter(docWriter, obj.Dict);
+                    Pdf17Writer.WriteAscii(docWriter, "\nstream\n"u8);
 
-                    SerializeTo(ms, obj.Dict);
-
-                    var streamMarker = Encoding.UTF8.GetBytes("\nstream\n");
-                    ms.Write(streamMarker, 0, streamMarker.Length);
-
-                    if (shouldCompress && pbw is not null)
+                    if (shouldCompress)
                     {
-                        pbw.CopyTo(ms);
-                        pbw.Dispose();
+                        compWriter.CopyTo(docWriter);
                     }
-                    else ms.Write(streamData, 0, streamData.Length);
+                    else
+                    {
+                        docWriter.Write(streamData);
+                    }
 
-                    var suffixBytes = Encoding.UTF8.GetBytes("\nendstream\nendobj\n");
-                    ms.Write(suffixBytes, 0, suffixBytes.Length);
+                    Pdf17Writer.WriteAscii(docWriter, "\nendstream\nendobj\n"u8);
                 }
                 else
                 {
-                    var header = Encoding.UTF8.GetBytes($"{obj.Id} 0 obj\n");
-                    ms.Write(header, 0, header.Length);
-                    SerializeTo(ms, obj.Dict);
-                    var endBytes = Encoding.UTF8.GetBytes("\nendobj\n");
-                    ms.Write(endBytes, 0, endBytes.Length);
+                    SerializeToWriter(docWriter, obj.Dict);
+                    Pdf17Writer.WriteAscii(docWriter, "\nendobj\n"u8);
                 }
             }
 
-            int xrefOffset = (int)ms.Position;
+            foreach (var obj in _objects) EmitObject(obj);
+            foreach (var obj in transientObjects) EmitObject(obj);
 
-            var xrefHeader = Encoding.UTF8.GetBytes($"xref\n0 {_objects.Count + 1}\n0000000000 65535 f \n");
-            ms.Write(xrefHeader, 0, xrefHeader.Length);
-            for (int i = 1; i <= _objects.Count; i++)
-            {
-                var line = Encoding.UTF8.GetBytes($"{offsets[i]:D10} 00000 n \n");
-                ms.Write(line, 0, line.Length);
-            }
+            long xrefOffset = docWriter.WrittenLength;
+            Pdf17Writer.WriteXrefAndTrailer(docWriter, offsets, totalObjects + 1, catalogRef.Id, xrefOffset);
 
-            var trailerHeader = Encoding.UTF8.GetBytes("trailer\n");
-            ms.Write(trailerHeader, 0, trailerHeader.Length);
-            SerializeTo(ms, new Dictionary<string, object> { ["Size"] = _objects.Count + 1, ["Root"] = catalogRef });
-            ms.Write(Encoding.UTF8.GetBytes("\n"), 0, 1);
-
-            var startxref = Encoding.UTF8.GetBytes($"startxref\n{xrefOffset}\n%%EOF\n");
-            ms.Write(startxref, 0, startxref.Length);
-
-            return ms.ToArray();
+            return docWriter.ToArray();
         }
     }
 }

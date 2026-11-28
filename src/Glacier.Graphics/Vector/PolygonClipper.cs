@@ -1,34 +1,39 @@
 namespace Glacier.Graphics.Vector;
 
 using System;
+using System.Buffers;
 using System.Runtime.CompilerServices;
-using System.Runtime.InteropServices;
 
 /// <summary>
 /// High-throughput zero/low-allocation polygon clipper implementing Sutherland-Hodgman
-/// and Vatti general clipping algorithms backed by native unmanaged scratch buffers.
+/// convex polygon clipping and point-in-polygon winding queries backed by stack/pooled scratch buffers.
 /// </summary>
-public static unsafe class PolygonClipper
+public static class PolygonClipper
 {
+    private const int StackAllocThreshold = 256;
+
     /// <summary>
     /// Clips a polygon against an axis-aligned bounding rectangle using Sutherland-Hodgman.
-    /// Uses unmanaged native memory scratch buffers to avoid managed GC allocations.
+    /// Uses stackalloc for small polygons and <see cref="ArrayPool{T}"/> for large polygons.
     /// </summary>
     public static int ClipToRect(ReadOnlySpan<PointF> input, in RectF rect, Span<PointF> output)
     {
         if (input.Length < 3) return 0;
 
         int maxVertices = Math.Max(input.Length * 4, 64);
-        PointF* bufferA = (PointF*)NativeMemory.Alloc((nuint)(maxVertices * sizeof(PointF)));
-        PointF* bufferB = (PointF*)NativeMemory.Alloc((nuint)(maxVertices * sizeof(PointF)));
+        PointF[]? rentedA = null;
+        PointF[]? rentedB = null;
+
+        Span<PointF> bufferA = maxVertices <= StackAllocThreshold
+            ? stackalloc PointF[maxVertices]
+            : (rentedA = ArrayPool<PointF>.Shared.Rent(maxVertices)).AsSpan(0, maxVertices);
+        Span<PointF> bufferB = maxVertices <= StackAllocThreshold
+            ? stackalloc PointF[maxVertices]
+            : (rentedB = ArrayPool<PointF>.Shared.Rent(maxVertices)).AsSpan(0, maxVertices);
 
         try
         {
-            fixed (PointF* pInput = input)
-            {
-                Buffer.MemoryCopy(pInput, bufferA, maxVertices * sizeof(PointF), input.Length * sizeof(PointF));
-            }
-
+            input.CopyTo(bufferA);
             int count = input.Length;
 
             count = ClipLeft(bufferA, count, bufferB, maxVertices, rect.Left);
@@ -37,23 +42,19 @@ public static unsafe class PolygonClipper
             count = ClipBottom(bufferB, count, bufferA, maxVertices, rect.Bottom);
 
             int resultCount = Math.Min(count, output.Length);
-            for (int i = 0; i < resultCount; i++)
-            {
-                output[i] = bufferA[i];
-            }
-
+            bufferA.Slice(0, resultCount).CopyTo(output);
             return resultCount;
         }
         finally
         {
-            NativeMemory.Free(bufferA);
-            NativeMemory.Free(bufferB);
+            if (rentedA != null) ArrayPool<PointF>.Shared.Return(rentedA);
+            if (rentedB != null) ArrayPool<PointF>.Shared.Return(rentedB);
         }
     }
 
     /// <summary>
     /// Clips a subject polygon against a convex clipping polygon using Sutherland-Hodgman.
-    /// Backed by NativeMemory unmanaged buffers.
+    /// Uses stackalloc for small polygons and <see cref="ArrayPool{T}"/> for large polygons.
     /// </summary>
     public static int ClipConvex(
         ReadOnlySpan<PointF> subject,
@@ -63,16 +64,19 @@ public static unsafe class PolygonClipper
         if (subject.Length < 3 || clipPolygon.Length < 3) return 0;
 
         int maxVertices = Math.Max((subject.Length + clipPolygon.Length) * 4, 128);
-        PointF* bufIn = (PointF*)NativeMemory.Alloc((nuint)(maxVertices * sizeof(PointF)));
-        PointF* bufOut = (PointF*)NativeMemory.Alloc((nuint)(maxVertices * sizeof(PointF)));
+        PointF[]? rentedA = null;
+        PointF[]? rentedB = null;
+
+        Span<PointF> bufIn = maxVertices <= StackAllocThreshold
+            ? stackalloc PointF[maxVertices]
+            : (rentedA = ArrayPool<PointF>.Shared.Rent(maxVertices)).AsSpan(0, maxVertices);
+        Span<PointF> bufOut = maxVertices <= StackAllocThreshold
+            ? stackalloc PointF[maxVertices]
+            : (rentedB = ArrayPool<PointF>.Shared.Rent(maxVertices)).AsSpan(0, maxVertices);
 
         try
         {
-            fixed (PointF* pSub = subject)
-            {
-                Buffer.MemoryCopy(pSub, bufIn, maxVertices * sizeof(PointF), subject.Length * sizeof(PointF));
-            }
-
+            subject.CopyTo(bufIn);
             int inCount = subject.Length;
 
             for (int c = 0; c < clipPolygon.Length; c++)
@@ -94,48 +98,43 @@ public static unsafe class PolygonClipper
 
                     if (eInside)
                     {
-                        if (!sInside)
+                        if (!sInside && outCount < maxVertices)
                         {
-                            if (outCount < maxVertices)
-                                bufOut[outCount++] = LineIntersection(cp1, cp2, s, e);
+                            bufOut[outCount++] = LineIntersection(cp1, cp2, s, e);
                         }
                         if (outCount < maxVertices)
+                        {
                             bufOut[outCount++] = e;
+                        }
                     }
-                    else if (sInside)
+                    else if (sInside && outCount < maxVertices)
                     {
-                        if (outCount < maxVertices)
-                            bufOut[outCount++] = LineIntersection(cp1, cp2, s, e);
+                        bufOut[outCount++] = LineIntersection(cp1, cp2, s, e);
                     }
                     s = e;
                 }
 
-                // Swap pointers for next edge
-                PointF* temp = bufIn;
+                // Copy/swap spans for next edge
+                Span<PointF> temp = bufIn;
                 bufIn = bufOut;
                 bufOut = temp;
                 inCount = outCount;
             }
 
             int finalCount = Math.Min(inCount, output.Length);
-            for (int i = 0; i < finalCount; i++)
-            {
-                output[i] = bufIn[i];
-            }
-
+            bufIn.Slice(0, finalCount).CopyTo(output);
             return finalCount;
         }
         finally
         {
-            NativeMemory.Free(bufIn);
-            NativeMemory.Free(bufOut);
+            if (rentedA != null) ArrayPool<PointF>.Shared.Return(rentedA);
+            if (rentedB != null) ArrayPool<PointF>.Shared.Return(rentedB);
         }
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static bool IsInside(PointF edge, PointF edgeStart, PointF pt)
     {
-        // Cross product determines which side of oriented edge line pt lies on
         return (edge.X * (pt.Y - edgeStart.Y) - edge.Y * (pt.X - edgeStart.X)) >= 0f;
     }
 
@@ -155,7 +154,7 @@ public static unsafe class PolygonClipper
         return new PointF(a1.X + t * dAx, a1.Y + t * dAy);
     }
 
-    private static int ClipLeft(PointF* src, int srcCount, PointF* dst, int dstCapacity, float left)
+    private static int ClipLeft(ReadOnlySpan<PointF> src, int srcCount, Span<PointF> dst, int dstCapacity, float left)
     {
         if (srcCount == 0) return 0;
         int dstCount = 0;
@@ -184,7 +183,7 @@ public static unsafe class PolygonClipper
         return dstCount;
     }
 
-    private static int ClipRight(PointF* src, int srcCount, PointF* dst, int dstCapacity, float right)
+    private static int ClipRight(ReadOnlySpan<PointF> src, int srcCount, Span<PointF> dst, int dstCapacity, float right)
     {
         if (srcCount == 0) return 0;
         int dstCount = 0;
@@ -213,7 +212,7 @@ public static unsafe class PolygonClipper
         return dstCount;
     }
 
-    private static int ClipTop(PointF* src, int srcCount, PointF* dst, int dstCapacity, float top)
+    private static int ClipTop(ReadOnlySpan<PointF> src, int srcCount, Span<PointF> dst, int dstCapacity, float top)
     {
         if (srcCount == 0) return 0;
         int dstCount = 0;
@@ -242,7 +241,7 @@ public static unsafe class PolygonClipper
         return dstCount;
     }
 
-    private static int ClipBottom(PointF* src, int srcCount, PointF* dst, int dstCapacity, float bottom)
+    private static int ClipBottom(ReadOnlySpan<PointF> src, int srcCount, Span<PointF> dst, int dstCapacity, float bottom)
     {
         if (srcCount == 0) return 0;
         int dstCount = 0;
@@ -270,7 +269,6 @@ public static unsafe class PolygonClipper
         }
         return dstCount;
     }
-
 
     /// <summary>
     /// Computes winding number of point relative to polygon.

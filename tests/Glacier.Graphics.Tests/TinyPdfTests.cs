@@ -3,6 +3,7 @@ using System.Buffers.Binary;
 using System.Text;
 using Xunit;
 using Glacier.Graphics.Pdf;
+using Glacier.Graphics.Text;
 
 namespace Glacier.Graphics.Tests;
 
@@ -52,7 +53,7 @@ public class TinyPdfTests
         byte[] pdf = builder.Build();
 
         string content = Encoding.Latin1.GetString(pdf);
-        Assert.StartsWith("%PDF-1.4", content);
+        Assert.StartsWith("%PDF-1.7", content);
         Assert.Contains("xref", content);
         Assert.Contains("trailer", content);
         Assert.Contains("%%EOF", content);
@@ -379,7 +380,7 @@ public class TinyPdfTests
         bw.Flush();
 
         byte[] fontBytes = ms.ToArray();
-        var parser = new TrueTypeFontMetricsParser(fontBytes);
+        var parser = new TrueTypeFont(fontBytes);
 
         Assert.Equal(1000, parser.UnitsPerEm);
         Assert.Equal(800, parser.Ascender);
@@ -481,7 +482,7 @@ public class TinyPdfTests
         bw.Flush();
 
         byte[] fontBytes = ms.ToArray();
-        var parser = new TrueTypeFontMetricsParser(fontBytes);
+        var parser = new TrueTypeFont(fontBytes);
 
         // Verification: UnitsPerEm MUST be 2048 from offset 18, NOT 64175 (0xFAAF) from offset 36
         Assert.Equal(2048, parser.UnitsPerEm);
@@ -507,7 +508,7 @@ public class TinyPdfTests
             return; // Skip on environments where arial.ttf is not installed
 
         byte[] fontBytes = File.ReadAllBytes(arialPath);
-        var parser = new TrueTypeFontMetricsParser(fontBytes);
+        var parser = new TrueTypeFont(fontBytes);
 
         // Arial is authored with 2048 unitsPerEm; offset 36 contains xMin (-1361 = 64175)
         Assert.Equal(2048, parser.UnitsPerEm);
@@ -584,8 +585,8 @@ public class TinyPdfTests
         string latin1 = Encoding.Latin1.GetString(pdf);
 
         Assert.Contains("(Price: \x80" + "100 / \xA3" + "85 \x97 \x93Smart\x94 \x95 \x85 -> >= 99%) Tj", latin1);
-        Assert.DoesNotContain("\xE2\x82\xAC", latin1); // No UTF-8 Euro mojibake
-        Assert.DoesNotContain("\xE2\x80\x94", latin1); // No UTF-8 Em-dash mojibake
+        Assert.DoesNotContain("\xE2\x82\xAC", latin1, StringComparison.Ordinal); // No UTF-8 Euro mojibake
+        Assert.DoesNotContain("\xE2\x80\x94", latin1, StringComparison.Ordinal); // No UTF-8 Em-dash mojibake
     }
 
     [Fact]
