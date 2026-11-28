@@ -14,7 +14,7 @@
 
     <!-- NuGet Package Properties -->
     <PackageId>Glacier.Graphics</PackageId>
-    <Version>1.2.1</Version>
+    <Version>1.2.2</Version>
     <PackageReleaseNotes>v1.2.1: Rasterization, buffer pool, and vector path stability hardening.</PackageReleaseNotes>
     <Authors>Ian Cowley</Authors>
     <Company>Glacier High-Performance Ecosystem</Company>
